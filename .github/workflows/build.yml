@@ -1,4 +1,4 @@
-name: Build NFSProStreetMonitor (x86)
+name: Build statsEdps (x86)
 
 on:
   push:
@@ -16,21 +16,21 @@ jobs:
         with:
           arch: x86
 
-      - name: Compile DLL and EXE (x86)
+      - name: Compile statsEdps (x86)
         shell: cmd
         run: |
-          if exist "NFSProStreetMonitor\hook_dll\prostreet_hooks.cpp" cd NFSProStreetMonitor
+          if exist "statsEdps\hook_dll\statsEdps_hooks.cpp" cd statsEdps
           if not exist bin mkdir bin
-          cl /nologo /std:c++17 /O2 /MT /EHsc /utf-8 /D_CRT_SECURE_NO_WARNINGS /LD /I common hook_dll\prostreet_hooks.cpp /Fe:bin\prostreet_hooks.dll /Fo:bin\ /link /NOLOGO user32.lib kernel32.lib
+          cl /nologo /std:c++17 /O2 /MT /EHsc /utf-8 /D_CRT_SECURE_NO_WARNINGS /LD /I common hook_dll\statsEdps_hooks.cpp /Fe:bin\statsEdps_hooks.dll /Fo:bin\ /link /NOLOGO user32.lib kernel32.lib
           if errorlevel 1 exit /b 1
-          cl /nologo /std:c++17 /O2 /MT /EHsc /utf-8 /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /I common app_exe\main_app.cpp /Fe:bin\NFSProStreetMonitor.exe /Fo:bin\ /link /NOLOGO /SUBSYSTEM:WINDOWS user32.lib gdi32.lib comdlg32.lib advapi32.lib kernel32.lib
+          cl /nologo /std:c++17 /O2 /MT /EHsc /utf-8 /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /I common app_exe\main_app.cpp /Fe:bin\statsEdps.exe /Fo:bin\ /link /NOLOGO /SUBSYSTEM:WINDOWS user32.lib gdi32.lib comdlg32.lib advapi32.lib kernel32.lib
           if errorlevel 1 exit /b 1
 
       - name: Upload built binaries
         uses: actions/upload-artifact@v4
         with:
-          name: NFSProStreetMonitor-x86-bin
+          name: statsEdps-v1.0.3-x86
           path: |
-            **/bin/NFSProStreetMonitor.exe
-            **/bin/prostreet_hooks.dll
+            **/bin/statsEdps.exe
+            **/bin/statsEdps_hooks.dll
           if-no-files-found: error
