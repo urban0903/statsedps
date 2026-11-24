@@ -24,6 +24,7 @@ static_assert(sizeof(void*) == 4, "prostreet_hooks.dll MUST be compiled as 32-bi
 static HMODULE  g_hSelf        = nullptr;
 static uint32_t g_nfsBase      = 0x00400000u;
 static HANDLE   g_hMap         = nullptr;
+static HANDLE   g_hCmdEvent    = nullptr;
 static ShmSharedState* g_shm   = nullptr;
 static HANDLE   g_hWorker      = nullptr;
 static std::atomic<bool> g_stopWorker{false};
@@ -243,12 +244,13 @@ extern "C" void __cdecl OnGarageMain(HookRegs* r) {
     const uint32_t retCarlot = g_nfsBase + (0x0072EE87u - 0x00400000u);
 
     bool allowed = false;
-    if (retAddr == retGarage) {
+    if (g_inTuningUi == 1) {
+        g_monIsBot = 0; g_monCtxMode = CTX_TUNING_UI; allowed = true;
+    } else if (retAddr == retGarage) {
         g_raceDayActive = 0; g_monIsBot = 0; g_monCtxMode = CTX_GARAGE; allowed = true;
     } else if (retAddr == retCarlot) {
+        // 0x0072EE87 вызывается и в Стайлинге / Тюнинге / Магазине, и в Автосалоне — не сбрасываем BP!
         g_raceDayActive = 0; g_monIsBot = 0; g_monCtxMode = CTX_CARLOT; allowed = true;
-    } else if (g_inTuningUi == 1) {
-        g_monIsBot = 0; g_monCtxMode = CTX_TUNING_UI; allowed = true;
     } else if (g_monIsBot == 0 || (carPtr != 0 && carPtr == g_playerCarPtr)) {
         g_monIsBot = 0;
         if (g_raceDayActive != 0 && g_monCtxMode != CTX_RACEDAY_HUB) g_monCtxMode = CTX_RACEDAY_PLAY;
@@ -533,6 +535,8 @@ struct BpRecord {
     uint32_t lastRingSeq = 0;
     uint64_t lastSigHash = 0;
     uint32_t lastChangedTick = 0;
+    int      cachedUpgCnt = 0;
+    int      cachedNzCnt = 0;
 };
 
 struct SliderBound { float minB = -1.0f, maxB = 1.0f; bool locked = false; };
@@ -565,7 +569,22 @@ struct WorkerState {
     std::unordered_map<uint32_t, SliderBound> curBounds;
     bool hasLiveBounds = false;
     uint32_t lastBoundsTdPtr = 0;
+    uint32_t boundsTdStartTick = 0;
+    uint32_t lastBoundsPollTick = 0;
     std::string curPartsSig;
+    // v2 performance caches & throttles
+    uint32_t lastPtrProbeTick = 0;
+    uint32_t lastSigPollTick = 0;
+    uint32_t lastSculptPollTick = 0;
+    uint32_t lastActiveActivityTick = 0;
+    uint32_t lastPublishTick = 0;
+    uint32_t lastCtxModeSeen = 0xFFFFFFFFu;
+    bool     lastInTuningUiSeen = false;
+    uint64_t lastUpgKeyHash = 0;
+    std::string cachedUpgShort[NUM_UPGRADE_PARTS];
+    uint64_t lastFastPubHash = 0;
+    float    lastSlidersSnap[NUM_SLIDERS] = {};
+    float    cachedSculptZones[AUTOSCULPT_READ_SLOTS][AUTOSCULPT_ZONES] = {};
 };
 static WorkerState g_ws;
 
@@ -948,13 +967,15 @@ static bool RegisterBp(uint32_t bp, int botTag, uint32_t ringSeq, bool directRef
     uint64_t sig = CalcBpQuickSig(bp, u, nz);
     if (!isNew && rec.lastSigHash != 0 && rec.lastSigHash != sig) rec.lastChangedTick = GetTickCount();
     rec.lastSigHash = sig;
+    rec.cachedUpgCnt = u;
+    rec.cachedNzCnt = nz;
     return true;
 }
 
 static int ScanHeapForBlueprints(bool force) {
     if (!g_ws.vltReady || g_ws.allPartPtrs.empty()) return 0;
     uint32_t now = GetTickCount();
-    if (!force && (now - g_ws.lastHeapScanTick) < 2500u) return 0;
+    if (!force && (now - g_ws.lastHeapScanTick) < 2000u) return 0;
     g_ws.lastHeapScanTick = now;
 
     int found = 0;
@@ -1216,17 +1237,23 @@ static std::vector<uint32_t> CollectMatchingBps(const std::string& canonHash, bo
 }
 
 static uint32_t ResolveActiveBp(
-    const std::string& canonHash, uint32_t ctxMode, uint32_t carPtr, uint32_t ratingPtr,
+    const std::string& canonHash, uint32_t /*ctxMode*/, uint32_t carPtr, uint32_t ratingPtr,
     const std::unordered_map<uint32_t, float>& liveMapVals,
-    uint32_t& outCandCount, uint32_t& outCandIdx, std::string& outSourceLabel
+    uint32_t& outCandCount, uint32_t& outCandIdx, std::string& outSourceLabel,
+    bool forceRefresh = false
 ) {
     outCandCount = 0; outCandIdx = 0;
     IngestBpRing();
-    if (ctxMode == CTX_CARLOT) { outSourceLabel = "Автосалон (без BP)"; return 0; }
-    if (canonHash.empty())     { outSourceLabel = "Ожидание авто"; return 0; }
+    if (canonHash.empty()) { outSourceLabel = "Ожидание авто"; return 0; }
 
-    ProbeLivePointersForBp(carPtr, ratingPtr);
+    uint32_t now = GetTickCount();
     std::vector<uint32_t> cands = CollectMatchingBps(canonHash, false);
+
+    if (forceRefresh || cands.empty() || (now - g_ws.lastPtrProbeTick) >= 500u) {
+        g_ws.lastPtrProbeTick = now;
+        ProbeLivePointersForBp(carPtr, ratingPtr);
+        cands = CollectMatchingBps(canonHash, false);
+    }
     if (cands.empty()) {
         ScanHeapForBlueprints(false);
         cands = CollectMatchingBps(canonHash, false);
@@ -1246,17 +1273,25 @@ static uint32_t ResolveActiveBp(
         g_ws.pinnedBpAddr = 0;
     }
 
-    uint32_t now = GetTickCount(), maxSeq = 0;
+    uint32_t maxSeq = 0;
     for (uint32_t bp : cands) maxSeq = std::max(maxSeq, g_ws.bpPool[bp].lastRingSeq);
+
+    bool doSig = forceRefresh || (now - g_ws.lastSigPollTick) >= 250u;
+    if (doSig) g_ws.lastSigPollTick = now;
 
     uint32_t bestBp = 0; int bestScore = -999999; std::string bestTag = "HeapScan"; size_t bestIdx = 0;
     for (size_t idx = 0; idx < cands.size(); ++idx) {
         uint32_t bp = cands[idx];
         BpRecord& rec = g_ws.bpPool[bp];
-        int upgCnt = 0, nzCnt = 0;
-        uint64_t sig = CalcBpQuickSig(bp, upgCnt, nzCnt);
-        if (rec.lastSigHash != 0 && rec.lastSigHash != sig) rec.lastChangedTick = now;
-        rec.lastSigHash = sig;
+        if (doSig || rec.lastSigHash == 0) {
+            int u = 0, nz = 0;
+            uint64_t sig = CalcBpQuickSig(bp, u, nz);
+            if (rec.lastSigHash != 0 && rec.lastSigHash != sig) rec.lastChangedTick = now;
+            rec.lastSigHash = sig;
+            rec.cachedUpgCnt = u;
+            rec.cachedNzCnt = nz;
+        }
+        int upgCnt = rec.cachedUpgCnt, nzCnt = rec.cachedNzCnt;
 
         int score = 0; std::string tag = "HeapScan";
         if (rec.seenAsBot && !rec.playerOwned) { score -= 600; tag = "Bot?"; }
@@ -1378,13 +1413,18 @@ static void HandleCommand(
                 }
             }
         }
+        g_ws.lastActiveActivityTick = GetTickCount();
+        g_ws.lastFastPubHash = 0;
         g_shm->cmdResultOk = wrote ? 1u : 0u;
         return;
     }
     if (cmdType == CMD_INSTALL_PART) {
         if (p1 >= NUM_INSPECT_SLOTS) return;
         uint32_t slotNum = INSPECT_SLOT_DEFS[p1].slot, idx = p2;
-        std::vector<uint32_t> bps = CollectMatchingBps(g_ws.activeCanonHash, true);
+        // Принудительно находим ВСЕ живые копии Blueprint в памяти (Гараж + рабочая копия Тюнинга/Магазина)
+        ScanHeapForBlueprints(true);
+        bool filterPlayerOnly = (g_raceDayActive != 0);
+        std::vector<uint32_t> bps = CollectMatchingBps(g_ws.activeCanonHash, filterPlayerOnly);
         if (g_ws.pinnedBpAddr != 0 && IsValidBlueprint(g_ws.pinnedBpAddr)) { bps.clear(); bps.push_back(g_ws.pinnedBpAddr); }
         if (bps.empty() && IsValidBlueprint(g_ws.activeBpAddr)) bps.push_back(g_ws.activeBpAddr);
         if (bps.empty()) {
@@ -1439,6 +1479,9 @@ static void HandleCommand(
         }
         if (!inTuningUi) { g_ws.curBounds.clear(); g_ws.hasLiveBounds = false; }
         g_ws.lastCatalogKeyHash = 0;
+        g_ws.lastUpgKeyHash = 0;
+        g_ws.lastFastPubHash = 0;
+        g_ws.lastActiveActivityTick = GetTickCount();
         g_shm->cmdResultOk = 1;
         std::snprintf(g_shm->cmdResultMsg, sizeof(g_shm->cmdResultMsg),
                       "Установлено [%s]: w2=%u%s (BP: %d)",
@@ -1507,6 +1550,17 @@ static DWORD WINAPI WorkerThreadProc(LPVOID) {
         }
 
         bool inTuningUi = (g_inTuningUi == 1) && IsValidPtr(g_tuningDataPtr);
+        bool ctxChanged = (g_monCtxMode != g_ws.lastCtxModeSeen) || (inTuningUi != g_ws.lastInTuningUiSeen);
+        if (ctxChanged) {
+            g_ws.lastCtxModeSeen = g_monCtxMode;
+            g_ws.lastInTuningUiSeen = inTuningUi;
+            g_ws.lastActiveActivityTick = now;
+            if (!g_ws.activeCanonHash.empty()) {
+                // При входе/выходе в Тюнинг или Стайлинг сразу ловим рабочую копию Blueprint!
+                ScanHeapForBlueprints(false);
+            }
+        }
+
         std::unordered_map<uint32_t, float> liveMapVals;
         std::unordered_map<uint32_t, uint32_t> liveMapNodes;
         int liveValCnt = 0;
@@ -1514,10 +1568,20 @@ static DWORD WINAPI WorkerThreadProc(LPVOID) {
         if (inTuningUi) {
             uint32_t td = g_tuningDataPtr;
             liveValCnt = TraverseSliderTree(td + 0x2Cu, false, &liveMapVals, &liveMapNodes, nullptr);
-            if (td != g_ws.lastBoundsTdPtr || !g_ws.hasLiveBounds) {
+            if (td != g_ws.lastBoundsTdPtr) {
+                g_ws.lastBoundsTdPtr = td;
+                g_ws.boundsTdStartTick = now;
+                g_ws.lastBoundsPollTick = 0;
+            }
+            bool needBounds = (!g_ws.hasLiveBounds) ||
+                              ((now - g_ws.boundsTdStartTick) < 1200u && (now - g_ws.lastBoundsPollTick) >= 80u) ||
+                              (g_ws.curBounds.size() < NUM_SLIDERS && (now - g_ws.lastBoundsPollTick) >= 250u);
+            if (needBounds) {
+                g_ws.lastBoundsPollTick = now;
                 std::unordered_map<uint32_t, SliderBound> bnds;
-                if (TraverseSliderTree(td + 0x10u, true, nullptr, nullptr, &bnds) > 0) {
-                    g_ws.curBounds = bnds; g_ws.hasLiveBounds = true; g_ws.lastBoundsTdPtr = td;
+                if (TraverseSliderTree(td + 0x10u, true, nullptr, nullptr, &bnds) > 0 && bnds.size() >= g_ws.curBounds.size()) {
+                    g_ws.curBounds = bnds;
+                    g_ws.hasLiveBounds = true;
                 }
             }
         } else if (IsValidPtr(g_tuningMapPtr) && g_tuningMapSeq != g_ws.tuningMapSeqAtCarSwitch) {
@@ -1529,7 +1593,8 @@ static DWORD WINAPI WorkerThreadProc(LPVOID) {
         uint32_t activeBp = ResolveActiveBp(
             g_ws.activeCanonHash, g_monCtxMode,
             haveSnap ? localSnap.carPtr : 0, haveSnap ? localSnap.ratingPtr : 0,
-            liveMapVals, candCount, candIdx, bpSourceLabel
+            liveMapVals, candCount, candIdx, bpSourceLabel,
+            carOrModeChanged || ctxChanged
         );
         g_ws.activeBpAddr = activeBp;
 
@@ -1558,6 +1623,7 @@ static DWORD WINAPI WorkerThreadProc(LPVOID) {
         auto itVltCar = g_ws.vltCars.find(g_ws.activeCanonHash);
         const VltCarInfo* vltCar = (itVltCar != g_ws.vltCars.end()) ? &itVltCar->second : nullptr;
 
+        uint64_t upgHash = 1469598103934665603ULL ^ activeBp;
         for (int i = 0; i < NUM_INSPECT_SLOTS; ++i) {
             uint32_t w1 = 0, w2 = 0, idx = 0;
             if (activeBp != 0) {
@@ -1571,18 +1637,30 @@ static DWORD WINAPI WorkerThreadProc(LPVOID) {
                 upgIdx[i] = idx;
                 if (i > 0) partsSig += ",";
                 partsSig += std::to_string(idx);
-                if (activeBp != 0 && IsValidPtr(w1)) {
+                upgHash = (upgHash ^ w1) * 1099511628211ULL;
+                upgHash = (upgHash ^ w2) * 1099511628211ULL;
+            }
+        }
+        if (upgHash != g_ws.lastUpgKeyHash) {
+            g_ws.lastUpgKeyHash = upgHash;
+            for (int i = 0; i < NUM_UPGRADE_PARTS; ++i) {
+                if (activeBp != 0 && IsValidPtr(inspW1[i])) {
                     uint32_t dArr = 0, mCnt = 0, ic = 0, iKey = 0, arr3EF = 0;
-                    GetPartPhysicsArrayInfo(w1, dArr, mCnt);
-                    GetInfoColl3EF(w1, ic, iKey, arr3EF);
-                    ShmPartItem tmpIt; FillPartItem(0, 0, arr3EF, idx, tmpIt);
+                    GetPartPhysicsArrayInfo(inspW1[i], dArr, mCnt);
+                    GetInfoColl3EF(inspW1[i], ic, iKey, arr3EF);
+                    ShmPartItem tmpIt; FillPartItem(0, 0, arr3EF, inspIdx[i], tmpIt);
                     auto dec = ProStreetMeta::decodeStageAndBrand(
-                        INSPECT_SLOT_DEFS[i].slot, w2, mCnt,
+                        INSPECT_SLOT_DEFS[i].slot, inspW2[i], mCnt,
                         tmpIt.hasMeta3EF != 0, tmpIt.exactStage, tmpIt.cfgInStage, tmpIt.brandHash
                     );
-                    upgShort[i] = dec.shortStr;
-                } else upgShort[i] = "—";
+                    g_ws.cachedUpgShort[i] = dec.shortStr;
+                } else {
+                    g_ws.cachedUpgShort[i] = "—";
+                }
             }
+        }
+        for (int i = 0; i < NUM_UPGRADE_PARTS; ++i) {
+            upgShort[i] = g_ws.cachedUpgShort[i].empty() ? "—" : g_ws.cachedUpgShort[i];
         }
 
         std::string bKey = g_ws.activeCanonHash + "|" + std::to_string(g_ws.activeMode) + "|" + partsSig;
@@ -1615,7 +1693,7 @@ static DWORD WINAPI WorkerThreadProc(LPVOID) {
             auto itB = g_ws.curBounds.find(dst.hash);
             if (itB != g_ws.curBounds.end()) {
                 dst.minBound = itB->second.minB; dst.maxBound = itB->second.maxB; dst.locked = itB->second.locked ? 1 : 0;
-            } else if (g_ws.hasLiveBounds || g_monCtxMode == CTX_CARLOT || (!hasBpSliders && !inTuningUi)) {
+            } else if (g_ws.hasLiveBounds || (!hasBpSliders && !inTuningUi)) {
                 dst.minBound = 0.0f; dst.maxBound = 0.0f; dst.locked = 1;
             } else {
                 int pSlot = SLIDER_DEFS[i].partSlot;
@@ -1626,6 +1704,57 @@ static DWORD WINAPI WorkerThreadProc(LPVOID) {
             if (!dst.locked && (hasBpSliders || liveMapNodes.count(dst.hash) > 0)) dst.editable = 1;
         }
 
+        // Track slider changes for instant 100Hz boost
+        bool slidersMoved = false;
+        for (int i = 0; i < NUM_SLIDERS; ++i) {
+            if (std::fabs(outSliders[i].value - g_ws.lastSlidersSnap[i]) > 1e-4f) {
+                g_ws.lastSlidersSnap[i] = outSliders[i].value;
+                slidersMoved = true;
+            }
+        }
+        if (slidersMoved) g_ws.lastActiveActivityTick = now;
+
+        // Read Autosculpt throttled (every 80ms or on car/ctx change)
+        uint32_t asBase = (activeBp != 0) ? (activeBp + 0x188Cu) : g_autosculptPtr;
+        if (IsValidPtr(asBase) && (carOrModeChanged || ctxChanged || (now - g_ws.lastSculptPollTick) >= 80u)) {
+            g_ws.lastSculptPollTick = now;
+            uint8_t rawAs[AUTOSCULPT_READ_SLOTS * 0x30];
+            if (SafeRead(asBase + 4, rawAs, sizeof(rawAs))) {
+                for (int s = 0; s < AUTOSCULPT_READ_SLOTS; ++s) {
+                    for (int z = 0; z < AUTOSCULPT_ZONES; ++z) {
+                        float fv = 0.0f; std::memcpy(&fv, rawAs + s * 0x30 + z * 4, 4);
+                        if (!IsFiniteFloat(fv) || fv < -1.5f || fv > 1.5f) fv = 0.0f;
+                        g_ws.cachedSculptZones[s][z] = fv;
+                    }
+                }
+            }
+        }
+
+        // Fast fingerprint of telemetry so EXE only repaints when something actually changed!
+        uint64_t fHash = 1469598103934665603ULL;
+        auto mixU32 = [&](uint32_t v) { fHash = (fHash ^ v) * 1099511628211ULL; };
+        mixU32(lastSeenHookSeq); mixU32(g_monCtxMode); mixU32(g_raceDayActive);
+        mixU32(activeBp); mixU32(candCount); mixU32(candIdx); mixU32(g_ws.pinnedBpAddr);
+        mixU32(sliderSource); mixU32(g_ws.hasLiveBounds ? 1u : 0u); mixU32(inTuningUi ? 1u : 0u);
+        mixU32((uint32_t)g_ws.bpPool.size()); mixU32(asBase);
+        for (int i = 0; i < NUM_SLIDERS; ++i) {
+            uint32_t vb = 0, nb = 0, xb = 0;
+            std::memcpy(&vb, &outSliders[i].value, 4);
+            std::memcpy(&nb, &outSliders[i].minBound, 4);
+            std::memcpy(&xb, &outSliders[i].maxBound, 4);
+            mixU32(vb); mixU32(nb); mixU32(xb);
+            mixU32((uint32_t)outSliders[i].locked | ((uint32_t)outSliders[i].editable << 1) | ((uint32_t)outSliders[i].hasValue << 2));
+        }
+        for (int i = 0; i < NUM_INSPECT_SLOTS; ++i) { mixU32(inspW1[i]); mixU32(inspW2[i]); }
+        for (int s = 0; s < AUTOSCULPT_READ_SLOTS; ++s) {
+            for (int z = 0; z < 10; ++z) {
+                uint32_t zb = 0; std::memcpy(&zb, &g_ws.cachedSculptZones[s][z], 4); mixU32(zb);
+            }
+        }
+
+        if (fHash != g_ws.lastFastPubHash || (now - g_ws.lastPublishTick) >= 500u) {
+        g_ws.lastFastPubHash = fHash;
+        g_ws.lastPublishTick = now;
         // Publish Fast State
         g_shm->fastSeq = g_shm->fastSeq + 1;
         g_shm->hookSnapSeq = lastSeenHookSeq; g_shm->hasValidSnap = haveSnap ? 1u : 0u;
@@ -1657,7 +1786,6 @@ static DWORD WINAPI WorkerThreadProc(LPVOID) {
         g_shm->sliderSource = sliderSource; g_shm->hasLiveBounds = g_ws.hasLiveBounds ? 1 : 0; g_shm->inTuningUi = inTuningUi ? 1 : 0;
         std::memcpy(g_shm->sliders, outSliders, sizeof(outSliders));
 
-        uint32_t asBase = (activeBp != 0) ? (activeBp + 0x188Cu) : g_autosculptPtr;
         g_shm->autosculptBasePtr = asBase;
         if (activeBp != 0) {
             uint32_t bW2 = inspW2[7], hW2 = inspW2[8], sW2 = inspW2[9];
@@ -1674,18 +1802,7 @@ static DWORD WINAPI WorkerThreadProc(LPVOID) {
             std::strncpy(g_shm->hoodName, "—", sizeof(g_shm->hoodName) - 1);
             std::strncpy(g_shm->spoilerName, "—", sizeof(g_shm->spoilerName) - 1);
         }
-        if (IsValidPtr(asBase)) {
-            uint8_t rawAs[AUTOSCULPT_READ_SLOTS * 0x30];
-            if (SafeRead(asBase + 4, rawAs, sizeof(rawAs))) {
-                for (int s = 0; s < AUTOSCULPT_READ_SLOTS; ++s) {
-                    for (int z = 0; z < AUTOSCULPT_ZONES; ++z) {
-                        float fv = 0.0f; std::memcpy(&fv, rawAs + s * 0x30 + z * 4, 4);
-                        if (!IsFiniteFloat(fv) || fv < -1.5f || fv > 1.5f) fv = 0.0f;
-                        g_shm->autosculptZones[s][z] = fv;
-                    }
-                }
-            }
-        }
+        std::memcpy(g_shm->autosculptZones, g_ws.cachedSculptZones, sizeof(g_ws.cachedSculptZones));
         for (int i = 0; i < NUM_UPGRADE_PARTS; ++i) {
             g_shm->upgradeIdx[i] = upgIdx[i];
             std::strncpy(g_shm->upgradeShort[i], upgShort[i].c_str(), sizeof(g_shm->upgradeShort[i]) - 1);
@@ -1695,6 +1812,7 @@ static DWORD WINAPI WorkerThreadProc(LPVOID) {
             g_shm->inspectW1[i] = inspW1[i]; g_shm->inspectW2[i] = inspW2[i]; g_shm->inspectIdx[i] = inspIdx[i];
         }
         g_shm->fastSeq = g_shm->fastSeq + 1;
+        }
 
         // Update Catalog only when car or w1 changes
         uint32_t effW1[NUM_INSPECT_SLOTS] = {};
@@ -1755,10 +1873,11 @@ static DWORD WINAPI WorkerThreadProc(LPVOID) {
             g_shm->catalogSeq = g_shm->catalogSeq + 1;
         }
 
-        int slices = inTuningUi ? 6 : 12;
-        for (int sl = 0; sl < slices && !g_stopWorker.load(); ++sl) {
-            if (g_shm->unloadRequested != 0 || g_shm->cmdSeq != lastCmdHandled) break;
-            Sleep(5);
+        bool hotMode = inTuningUi || ((now - g_ws.lastActiveActivityTick) < 2500u);
+        DWORD waitMs = hotMode ? 10u : 20u;
+        if (g_shm->unloadRequested == 0 && g_shm->cmdSeq == lastCmdHandled) {
+            if (g_hCmdEvent) WaitForSingleObject(g_hCmdEvent, waitMs);
+            else Sleep(waitMs);
         }
     }
 
@@ -1766,6 +1885,7 @@ static DWORD WINAPI WorkerThreadProc(LPVOID) {
     Sleep(60);
     if (g_trampMem) { VirtualFree(g_trampMem, 0, MEM_RELEASE); g_trampMem = nullptr; }
     if (g_shm) { g_shm->dllUnloaded = 1; UnmapViewOfFile(g_shm); g_shm = nullptr; }
+    if (g_hCmdEvent) { CloseHandle(g_hCmdEvent); g_hCmdEvent = nullptr; }
     if (g_hMap) { CloseHandle(g_hMap); g_hMap = nullptr; }
     FreeLibraryAndExitThread(g_hSelf, 0);
     return 0;
@@ -1780,6 +1900,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*lpReserved*/) {
 
         g_hMap = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(ShmSharedState), SHM_NAME);
         if (!g_hMap) return FALSE;
+        g_hCmdEvent = CreateEventA(nullptr, FALSE, FALSE, SHM_CMD_EVENT_NAME);
         g_shm = reinterpret_cast<ShmSharedState*>(MapViewOfFile(g_hMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(ShmSharedState)));
         if (!g_shm) { CloseHandle(g_hMap); g_hMap = nullptr; return FALSE; }
         if (g_shm->magic != SHM_MAGIC || g_shm->version != SHM_VERSION) {

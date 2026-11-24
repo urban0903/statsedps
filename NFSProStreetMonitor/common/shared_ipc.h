@@ -10,6 +10,7 @@
 static constexpr uint32_t SHM_MAGIC   = 0x4E465350u; // 'NFSP'
 static constexpr uint32_t SHM_VERSION = 1u;
 static constexpr const char* SHM_NAME = "Local\\NFSProStreetMonitorSHM_v1";
+static constexpr const char* SHM_CMD_EVENT_NAME = "Local\\NFSProStreetMonitorCmdEvt_v1";
 
 static constexpr int NUM_SLIDERS       = 30;
 static constexpr int NUM_UPGRADE_PARTS = 8;

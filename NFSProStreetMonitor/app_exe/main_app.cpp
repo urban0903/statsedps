@@ -190,6 +190,7 @@ struct AppState {
     int browseIdx = -1;        // -1 = installed idx
     int scrollSame = 0;
     int scrollDiff = 0;
+    uint64_t lastDetailStateHash = 0;
 
     DetailRowView detailRows[NUM_INSPECT_SLOTS];
 
@@ -583,7 +584,7 @@ static void DrawLeftBrace(HDC hdc, int x, int yTop, int yBot) {
 // ============================================================================
 static std::string GetCtxLabel(uint32_t ctx, uint32_t rdAct) {
     switch (ctx) {
-        case CTX_CARLOT:       return "Автосалон [Игрок]";
+        case CTX_CARLOT:       return "Тюнинг / Магазин [Игрок]";
         case CTX_TUNING_UI:    return rdAct ? "Race Day: Тюнинг [Игрок]" : "Тюнинг [Игрок]";
         case CTX_RACEDAY_PLAY: return "Race Day [Игрок]";
         case CTX_RACEDAY_HUB:  return "Race Day: Хаб [Игрок]";
@@ -1536,7 +1537,7 @@ static void HandleButtonClick(int id) {
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE:
-            SetTimer(hwnd, 1, 55, nullptr);
+            SetTimer(hwnd, 1, 16, nullptr);
             return 0;
 
         case WM_TIMER: {
@@ -1571,7 +1572,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 }
             }
             if (dirty) {
-                g_app.rebuildDetailRows();
+                uint64_t dh = 1469598103934665603ULL;
+                auto mx = [&](uint32_t v) { dh = (dh ^ v) * 1099511628211ULL; };
+                mx(g_app.lastCatSeq); mx(g_app.shmCopy.activeBpAddr);
+                mx((uint32_t)g_app.activeTab); mx((uint32_t)g_app.selectedDetailRow); mx((uint32_t)(g_app.browseIdx + 2));
+                for (int i = 0; i < NUM_INSPECT_SLOTS; ++i) {
+                    mx(g_app.shmCopy.inspectW1[i]); mx(g_app.shmCopy.inspectW2[i]);
+                }
+                if (catChg || dh != g_app.lastDetailStateHash) {
+                    g_app.lastDetailStateHash = dh;
+                    g_app.rebuildDetailRows();
+                }
                 InvalidateRect(hwnd, nullptr, FALSE);
             } else if (!g_app.flashMsg.empty() && (GetTickCount() - g_app.flashTick) >= 4000u) {
                 g_app.flashMsg.clear();
@@ -1717,6 +1728,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
+    // Повышаем точность системного таймера Windows (4 мс) без лишних зависимостей линковки (winmm.dll)
+    using TimePeriodFn = UINT(WINAPI*)(UINT);
+    HMODULE hWinmm = LoadLibraryA("winmm.dll");
+    TimePeriodFn pTimeBegin = hWinmm ? reinterpret_cast<TimePeriodFn>(GetProcAddress(hWinmm, "timeBeginPeriod")) : nullptr;
+    TimePeriodFn pTimeEnd   = hWinmm ? reinterpret_cast<TimePeriodFn>(GetProcAddress(hWinmm, "timeEndPeriod")) : nullptr;
+    if (pTimeBegin) pTimeBegin(4);
+
     g_app.initFonts();
     g_app.dbs.initPaths();
     g_app.rebuildDetailRows();
@@ -1740,7 +1758,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 
     g_app.hwnd = CreateWindowExW(
         0, wc.lpszClassName,
-        L"NFS ProStreet — Нативный монитор (EXE + Hook DLL)",
+        L"NFS ProStreet — Нативный монитор v2 (EXE + Hook DLL)",
         style, sx, sy, ww, wh, nullptr, nullptr, hInst, nullptr
     );
     if (!g_app.hwnd) return 1;
@@ -1753,5 +1771,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    if (pTimeEnd) pTimeEnd(4);
+    if (hWinmm) FreeLibrary(hWinmm);
     return 0;
 }

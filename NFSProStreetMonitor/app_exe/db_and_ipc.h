@@ -423,6 +423,7 @@ struct Databases {
 // ============================================================================
 class GameBridge {
     HANDLE          hMap = nullptr;
+    HANDLE          hCmdEvent = nullptr;
     ShmSharedState* shm  = nullptr;
     DWORD           attachedPid = 0;
     uint32_t        lastConnectTryTick = 0;
@@ -511,6 +512,9 @@ public:
     DWORD getPid() const { return attachedPid; }
 
     void ensureSharedMem() {
+        if (!hCmdEvent) {
+            hCmdEvent = CreateEventA(nullptr, FALSE, FALSE, SHM_CMD_EVENT_NAME);
+        }
         if (shm) return;
         hMap = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(ShmSharedState), SHM_NAME);
         if (hMap) {
@@ -575,10 +579,11 @@ public:
         shm->cmdParam2 = p2;
         shm->cmdFParam = fp;
         shm->cmdSeq    = nextSeq;
+        if (hCmdEvent) SetEvent(hCmdEvent);
         if (!waitAck) return true;
         uint32_t t0 = GetTickCount();
-        while (shm->cmdAckSeq != nextSeq && (GetTickCount() - t0) < 1200u) {
-            Sleep(5);
+        while (shm->cmdAckSeq != nextSeq && (GetTickCount() - t0) < 1500u) {
+            Sleep(1);
         }
         if (shm->cmdAckSeq == nextSeq) {
             if (outOk)  *outOk  = (shm->cmdResultOk != 0);
@@ -637,11 +642,13 @@ public:
     void shutdownAndUnload() {
         if (shm && isConnected()) {
             shm->unloadRequested = 1;
+            if (hCmdEvent) SetEvent(hCmdEvent);
             uint32_t t0 = GetTickCount();
             while (shm->dllUnloaded == 0 && (GetTickCount() - t0) < 600u) {
-                Sleep(15);
+                Sleep(10);
             }
         }
+        if (hCmdEvent) { CloseHandle(hCmdEvent); hCmdEvent = nullptr; }
         if (shm) { UnmapViewOfFile(shm); shm = nullptr; }
         if (hMap) { CloseHandle(hMap); hMap = nullptr; }
     }
