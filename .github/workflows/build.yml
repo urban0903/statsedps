@@ -1,0 +1,36 @@
+name: Build NFSProStreetMonitor (x86)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC x86 (32-bit)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Compile DLL and EXE (x86)
+        shell: cmd
+        run: |
+          if exist "NFSProStreetMonitor\hook_dll\prostreet_hooks.cpp" cd NFSProStreetMonitor
+          if not exist bin mkdir bin
+          cl /nologo /std:c++17 /O2 /MT /EHsc /utf-8 /D_CRT_SECURE_NO_WARNINGS /LD /I common hook_dll\prostreet_hooks.cpp /Fe:bin\prostreet_hooks.dll /Fo:bin\ /link /NOLOGO user32.lib kernel32.lib
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++17 /O2 /MT /EHsc /utf-8 /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /I common app_exe\main_app.cpp /Fe:bin\NFSProStreetMonitor.exe /Fo:bin\ /link /NOLOGO /SUBSYSTEM:WINDOWS user32.lib gdi32.lib comdlg32.lib advapi32.lib kernel32.lib
+          if errorlevel 1 exit /b 1
+
+      - name: Upload built binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: NFSProStreetMonitor-x86-bin
+          path: |
+            **/bin/NFSProStreetMonitor.exe
+            **/bin/prostreet_hooks.dll
+          if-no-files-found: error
