@@ -8,11 +8,11 @@
 // ============================================================================
 
 static constexpr const char* APP_NAME         = "statsEdps";
-static constexpr const char* APP_VERSION      = "v1.0.4";
-static constexpr const char* APP_FULL_TITLE   = "statsEdps v1.0.4";
+static constexpr const char* APP_VERSION      = "v1.0.5";
+static constexpr const char* APP_FULL_TITLE   = "statsEdps v1.0.5";
 
 static constexpr uint32_t SHM_MAGIC   = 0x53454450u; // 'SEDP'
-static constexpr uint32_t SHM_VERSION = 4u;
+static constexpr uint32_t SHM_VERSION = 5u;
 static constexpr const char* SHM_NAME           = "Local\\statsEdpsSHM_v1";
 static constexpr const char* SHM_CMD_EVENT_NAME = "Local\\statsEdpsCmdEvt_v1";
 
@@ -234,22 +234,23 @@ static constexpr SliderDef SLIDER_DEFS[NUM_SLIDERS] = {
 };
 
 struct InspectSlotDef {
-    uint32_t    slot;
+    uint32_t    slot;    // legacy offset index from bp+0x68 (kept for brand_db compatibility)
+    uint32_t    feSlot;  // TRUE game slot index (0..164) in bp+0x58+feSlot*0x10 and FECustomizationRecord+0x34+feSlot*2
     const char* key;
     const char* nameUtf8;
 };
 
 static constexpr InspectSlotDef INSPECT_SLOT_DEFS[NUM_INSPECT_SLOTS] = {
-    { 123, "engine",     "Двигатель" },
-    { 122, "drivetrain", "Трансмиссия" },
-    { 124, "induction",  "Наддув" },
-    { 146, "suspension", "Подвеска" },
-    {   9, "brakes",     "Тормоза" },
-    { 148, "tires",      "Шины" },
-    { 130, "nitrous",    "Закись азота" },
-    {   7, "body",       "Кузов" },
-    {  78, "hood",       "Капот" },
-    {  90, "spoiler",    "Спойлер" },
+    { 123, 124, "engine",     "Двигатель" },
+    { 122, 123, "drivetrain", "Трансмиссия" },
+    { 124, 125, "induction",  "Наддув" },
+    { 146, 147, "suspension", "Подвеска" },
+    {   9,  10, "brakes",     "Тормоза" },
+    { 148, 149, "tires",      "Шины" },
+    { 130, 131, "nitrous",    "Закись азота" },
+    {   7,   8, "body",       "Кузов" },
+    {  78,  79, "hood",       "Капот" },
+    {  90,  91, "spoiler",    "Спойлер" },
 };
 
 static inline int findSliderIndexByHash(uint32_t hash) {

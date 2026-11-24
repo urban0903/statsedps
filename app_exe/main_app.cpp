@@ -598,13 +598,14 @@ static void PaintTopPanel(HDC hdc) {
     DrawBox(hdc, 8, 6, WIN_W - 8, 160, Col::PANEL_BG, Col::BORDER);
 
     bool conn = g_app.bridge.isConnected();
-    bool hasSnap = conn && g_app.shmCopy.hasValidSnap != 0 && g_app.shmCopy.baseHash[0] != '\0';
-    std::string baseH = hasSnap ? g_app.shmCopy.baseHash : "";
+    bool hasCar  = conn && g_app.shmCopy.baseHash[0] != '\0';
+    bool hasSnap = hasCar && g_app.shmCopy.hasValidSnap != 0;
+    std::string baseH = hasCar ? g_app.shmCopy.baseHash : "";
     auto mm = GetModeMeta(g_app.shmCopy.carMode);
 
     std::string carDisp = "Открой Автосалон (Магазин) или Гараж...";
     std::string modelOnly = "—";
-    if (hasSnap) {
+    if (hasCar) {
         auto itS = g_app.dbs.stockDB.find(baseH);
         const ProfileCarEntry* pe = g_app.dbs.getProfileCar(baseH);
         if (itS != g_app.dbs.stockDB.end()) {
@@ -624,9 +625,9 @@ static void PaintTopPanel(HDC hdc) {
 
     // Left column info
     DrawTextUtf8(hdc, 18, 13, "Активный автомобиль:", g_app.fnt8, Col::DIM);
-    DrawClippedUtf8(hdc, 146, 13, 492, 29, carDisp, g_app.fnt9B, hasSnap ? Col::NUM : Col::TEXT);
+    DrawClippedUtf8(hdc, 146, 13, 492, 29, carDisp, g_app.fnt9B, hasCar ? Col::NUM : Col::TEXT);
 
-    std::string modeLine = hasSnap
+    std::string modeLine = hasCar
         ? ("Режим: " + std::string(mm.name) + " [ID=" + std::to_string(g_app.shmCopy.carMode) + "]  |  " + GetCtxLabel(g_app.shmCopy.ctxMode, g_app.shmCopy.raceDayActive))
         : ("Подключение: " + g_app.bridge.getStatus());
     DrawClippedUtf8(hdc, 18, 32, 492, 48, modeLine, g_app.fnt8, conn ? Col::TEXT : Col::SLIDER_ACC);
@@ -642,9 +643,9 @@ static void PaintTopPanel(HDC hdc) {
                           g_app.shmCopy.activeBpAddr, g_app.shmCopy.bpSourceLabel,
                           g_app.shmCopy.custRecCount, g_app.shmCopy.totalBpInHeap);
         } else {
-            std::snprintf(bpLine, sizeof(bpLine), "BP: 0x%08X [Type=%u] | %s | Пул: %u",
-                          g_app.shmCopy.activeBpAddr, g_app.shmCopy.activeBpCarType,
-                          g_app.shmCopy.bpSourceLabel, g_app.shmCopy.totalBpInHeap);
+            std::snprintf(bpLine, sizeof(bpLine), "BP: 0x%08X [%s] | Карьера: поиск... | Пул: %u",
+                          g_app.shmCopy.activeBpAddr, g_app.shmCopy.bpSourceLabel,
+                          g_app.shmCopy.totalBpInHeap);
         }
     } else if (conn) {
         std::snprintf(bpLine, sizeof(bpLine), "BP: не найден (%s) | Пул: %u | VLT: %s",
@@ -655,32 +656,33 @@ static void PaintTopPanel(HDC hdc) {
     }
     DrawClippedUtf8(hdc, 18, 67, 492, 83, bpLine, g_app.fnt8B, (conn && g_app.shmCopy.activeBpAddr != 0) ? Col::SLIDER_POS : Col::SLIDER_ACC);
 
-    // Status line + Stock DB path
+    // Status line + Embedded DB confirmation
     DrawClippedUtf8(hdc, 18, 86, 492, 102, g_app.statusLine, g_app.fnt8, Col::TEXT);
-    std::string stockSrcDisp = g_app.dbs.stockIsEmbedded ? "Встроенная (76/76)" : ShortenPath(g_app.dbs.stockDbPath, 50);
-    DrawClippedUtf8(hdc, 18, 103, 492, 118, "База стока: " + stockSrcDisp, g_app.fnt7, g_app.dbs.stockIsEmbedded ? Col::SLIDER_POS : Col::DIM);
+    DrawClippedUtf8(hdc, 18, 103, 492, 118,
+                    std::string("Базы данных: Встроены в ") + APP_FULL_TITLE + " (Сток 76/76 + VLT 76/76)",
+                    g_app.fnt7B, Col::SLIDER_POS);
 
-    // Right column: DB Stats + File Pickers + BP Controls
+    // Right column: Version badge + DB Stats + BP Controls (без лишних кнопок файлов баз!)
+    DrawTextUtf8(hdc, 502, 13, std::string(APP_FULL_TITLE) + "  |  Встроенные базы: 76/76", g_app.fnt9B, Col::NUM);
     char s1[96], s2[96];
-    std::snprintf(s1, sizeof(s1), "База стока: %d/76  |  Во всех режимах: %d/76", g_app.dbs.statTotal, g_app.dbs.statFullAll);
+    std::snprintf(s1, sizeof(s1), "Сток: %d/76 (все режимы: %d/76)  |  VLT: %u/76",
+                  g_app.dbs.statTotal, g_app.dbs.statFullAll, (unsigned)g_app.dbs.profCars.size());
     std::snprintf(s2, sizeof(s2), "Грип: %d/76  Дрэг: %d/76  Скор: %d/76  Дрифт: %d/47",
                   g_app.dbs.statGrip, g_app.dbs.statDrag, g_app.dbs.statSpeed, g_app.dbs.statDrift);
-    DrawTextUtf8(hdc, 502, 13, s1, g_app.fnt8B, Col::TEXT);
-    DrawTextUtf8(hdc, 502, 30, s2, g_app.fnt8, Col::DIM);
-
-    DrawButton(hdc, BTN_PICK_STOCK, 502, 48, 668, 70, "Файл базы стока...");
-    DrawButton(hdc, BTN_PICK_VLT,   674, 48, 842, 70, "Файл VLT-базы...");
+    DrawTextUtf8(hdc, 502, 32, s1, g_app.fnt8, Col::TEXT);
+    DrawTextUtf8(hdc, 502, 48, s2, g_app.fnt8, Col::DIM);
 
     // Blueprint controls row
-    DrawButton(hdc, BTN_BP_RESCAN, 502, 75, 610, 97, "Найти BP", conn ? Col::NUM : Col::GRID, conn ? Col::NUM : Col::DIM);
-    DrawButton(hdc, BTN_BP_PREV,   616, 75, 674, 97, "◄ BP");
-    DrawButton(hdc, BTN_BP_NEXT,   678, 75, 736, 97, "BP ►");
-    DrawButton(hdc, BTN_BP_AUTO,   742, 75, 842, 97,
+    DrawButton(hdc, BTN_BP_RESCAN, 502, 74, 610, 97, "Найти BP", conn ? Col::NUM : Col::GRID, conn ? Col::NUM : Col::DIM);
+    DrawButton(hdc, BTN_BP_PREV,   616, 74, 674, 97, "◄ BP");
+    DrawButton(hdc, BTN_BP_NEXT,   678, 74, 736, 97, "BP ►");
+    DrawButton(hdc, BTN_BP_AUTO,   742, 74, 842, 97,
                (g_app.shmCopy.bpPinnedAddr != 0) ? "Авто (откр.)" : "Автовыбор",
                (g_app.shmCopy.bpPinnedAddr != 0) ? Col::SLIDER_ACC : Col::BORDER);
 
-    std::string profSrcDisp = g_app.dbs.profilesIsEmbedded ? "Встроенная (76/76)" : ShortenPath(g_app.dbs.profilesDbPath, 40);
-    DrawClippedUtf8(hdc, 502, 103, 842, 118, "VLT-база: " + profSrcDisp, g_app.fnt7, g_app.dbs.profilesIsEmbedded ? Col::SLIDER_POS : Col::DIM);
+    DrawClippedUtf8(hdc, 502, 103, 842, 118,
+                    hasSnap ? "Дино: LIVE (автопересчёт при правках)" : "Дино: открой авто в Гараже для расчёта",
+                    g_app.fnt7, hasSnap ? Col::SLIDER_POS : Col::DIM);
 
     // Bottom toolbar inside Top Panel
     DrawLine(hdc, 14, 122, WIN_W - 14, 122, Col::GRID);
@@ -1565,7 +1567,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_app.bridge.readCatalogSnapshot(g_app.shmCopy, g_app.lastCatSeq, catChg);
 
             bool dirty = fastChg || catChg;
-            if (fastChg && g_app.shmCopy.hasValidSnap) {
+            if (fastChg && g_app.shmCopy.baseHash[0] != '\0') {
                 std::string bh = g_app.shmCopy.baseHash;
                 std::string mk = GetModeMeta(g_app.shmCopy.carMode).key;
                 if (bh != g_app.activeBaseHash || mk != g_app.activeModeKey) {
@@ -1574,7 +1576,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     g_app.activeModeKey  = mk;
                     g_app.browseIdx = -1;
                     g_app.scrollSame = g_app.scrollDiff = 0;
-                    if (carChg) {
+                    if (carChg && g_app.shmCopy.hasValidSnap) {
                         std::memcpy(g_app.tempInitVals.data(), g_app.shmCopy.curVals, sizeof(float) * 21);
                         g_app.hasTempInit = true;
                     }
@@ -1776,7 +1778,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 
     g_app.hwnd = CreateWindowExW(
         0, wc.lpszClassName,
-        L"statsEdps v1.0.4",
+        L"statsEdps v1.0.5",
         style, sx, sy, ww, wh, nullptr, nullptr, hInst, nullptr
     );
     if (!g_app.hwnd) return 1;

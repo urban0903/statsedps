@@ -3,7 +3,7 @@ chcp 65001 >nul
 setlocal EnableDelayedExpansion
 
 echo ============================================================
-echo   statsEdps v1.0.4 - MSVC x86 (32-bit) Build Script
+echo   statsEdps v1.0.5 - MSVC x86 (32-bit) Build Script
 echo ============================================================
 
 where cl.exe >nul 2>&1

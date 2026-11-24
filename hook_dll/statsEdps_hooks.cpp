@@ -32,8 +32,44 @@ static uint8_t* g_trampMem     = nullptr;
 
 using CalcP1P7Fn   = void(__cdecl*)(uint32_t carPtr, uint32_t massBits, float* outBuf);
 using LookupPartFn = uint32_t(__cdecl*)(uint32_t outPart, uint32_t carType0, uint32_t a, uint32_t b, uint32_t c, uint32_t slot);
+using ThisCall0Fn  = uint32_t(__cdecl*)(uint32_t targetFn, void* thisPtr);
+using ThisCall1Fn  = uint32_t(__cdecl*)(uint32_t targetFn, void* thisPtr, uint32_t a1);
+using ThisCall2Fn  = uint32_t(__cdecl*)(uint32_t targetFn, void* thisPtr, uint32_t a1, uint32_t a2);
 static CalcP1P7Fn   g_callCalcP1P7   = nullptr;
 static LookupPartFn g_callLookupPart = nullptr;
+static ThisCall0Fn  g_callThis0      = nullptr;
+static ThisCall1Fn  g_callThis1      = nullptr;
+static ThisCall2Fn  g_callThis2      = nullptr;
+
+// Main-thread safe dispatcher (WH_GETMESSAGE on nfs.exe main window thread)
+static HWND    g_gameHwnd   = nullptr;
+static DWORD   g_mainTid    = 0;
+static HHOOK   g_hMsgHook   = nullptr;
+static HANDLE  g_hMtDoneEvt = nullptr;
+static std::atomic<int> g_mtPending{0};
+static volatile uint32_t g_inSelfDynoRecalc = 0;
+
+// Captured exact pvehArg passed to 00402380 (Attrib::Instance ctor) for live Dyno recalc
+static volatile uint32_t g_lastPvehArg   = 0;
+static volatile uint32_t g_lastPvehArgBp = 0;
+
+struct MainThreadJob {
+    enum Type { JOB_NONE = 0, JOB_RECALC_DYNO = 1, JOB_FIND_PACKED16 = 2 };
+    Type     type = JOB_NONE;
+    uint32_t bpAddr = 0;
+    uint32_t pvehArg = 0;
+    uint32_t mode = 0;
+    // For JOB_FIND_PACKED16
+    uint32_t carType0 = 0;
+    uint32_t feSlot = 0;
+    uint32_t targetW1 = 0;
+    uint32_t targetIdx = 0;
+    uint16_t curPacked = 0xFFFFu;
+    bool     found = false;
+    uint16_t outPacked = 0xFFFFu;
+    uint32_t outDbPart[4] = {};
+};
+static MainThreadJob g_mtJob;
 
 // Hook-captured volatile variables
 static volatile uint32_t g_monIsBot       = 0;
@@ -293,6 +329,30 @@ extern "C" void __cdecl OnSyncFromBlueprint(HookRegs* r) {
     }
 }
 
+// Hook at nfs.exe+175F70 (Garage) & nfs.exe+1A4BE1 (Tuning): capture exact arg1 passed to 00402380!
+extern "C" void __cdecl OnAttribInstCtor(HookRegs* r) {
+    if (g_inSelfDynoRecalc != 0) return;
+    uint32_t pvehArg = *reinterpret_cast<const uint32_t*>(r->esp_orig + 0x00);
+    if (pvehArg != 0) {
+        g_lastPvehArg = pvehArg;
+        uint32_t bp = g_directBuildBp;
+        if (IsValidPtr(bp)) g_lastPvehArgBp = bp;
+    }
+}
+
+// Hook at nfs.exe+133D50 (FECarCareerEntry::BuildBlueprint): ECX = careerEntry, [esp+04]=bpSlot, [esp+08]=Blueprint*!
+extern "C" void __cdecl OnCareerBuildBp(HookRegs* r) {
+    uint32_t entry = r->ecx;
+    uint32_t bpSlot = *reinterpret_cast<const uint32_t*>(r->esp_orig + 0x04);
+    uint32_t bp     = *reinterpret_cast<const uint32_t*>(r->esp_orig + 0x08);
+    if (!IsValidPtr(entry) || !IsValidPtr(bp) || bpSlot > 8u) return;
+    uint32_t custRec = entry + 4u + bpSlot * 0x7B4u;
+    PushBpRing(bp, custRec, 0u);
+    g_directCustRec = custRec;
+    g_directCustBp  = bp;
+    g_directCustSeq = g_directCustSeq + 1;
+}
+
 extern "C" void __cdecl OnGarageMain(HookRegs* r) {
     if (InterlockedExchange(&g_inGarageHook, 1) != 0) return;
 
@@ -304,7 +364,10 @@ extern "C" void __cdecl OnGarageMain(HookRegs* r) {
     const uint32_t retCarlot = g_nfsBase + (0x0072EE87u - 0x00400000u);
 
     bool allowed = false;
-    if (g_inTuningUi == 1) {
+    if (g_inSelfDynoRecalc != 0) {
+        g_monIsBot = 0;
+        allowed = true;
+    } else if (g_inTuningUi == 1) {
         g_monIsBot = 0; g_monCtxMode = CTX_TUNING_UI; allowed = true;
     } else if (retAddr == retGarage) {
         g_raceDayActive = 0; g_monIsBot = 0; g_monCtxMode = CTX_GARAGE; allowed = true;
@@ -384,6 +447,7 @@ extern "C" void __cdecl OnGarageMain(HookRegs* r) {
         g_hookSnapSeq = g_hookSnapSeq + 1;
         std::memcpy(&g_pubSnap, &st, sizeof(st));
         g_hookSnapSeq = g_hookSnapSeq + 1;
+        if (g_hCmdEvent) SetEvent(g_hCmdEvent);
     }
 
     InterlockedExchange(&g_inGarageHook, 0);
@@ -425,7 +489,7 @@ struct InlineHook {
     uint8_t  origBytes[16] = {};
     bool     installed  = false;
 };
-static constexpr int NUM_HOOKS = 10;
+static constexpr int NUM_HOOKS = 13;
 static InlineHook g_hooks[NUM_HOOKS] = {};
 
 static bool InstallPatchJump(InlineHook& hk, uint32_t addr, uint32_t stubAddr, size_t len) {
@@ -480,14 +544,44 @@ static bool InstallAllHooks() {
 
     // 0b. Helper: __cdecl uint32_t CallLookupPart(outPart, carType0, a, b, c, slot) -> calls nfs.exe+37F2E0 (__thiscall on 00AED1F8)
     g_callLookupPart = reinterpret_cast<LookupPartFn>(e.curPtr());
-    e.b(0x53); e.b(0x55); e.b(0x56); e.b(0x57); // push ebx, ebp, esi, edi (+0x10)
+    e.b(0x53); e.b(0x55); e.b(0x56); e.b(0x57);
     for (int k = 0; k < 6; ++k) {
-        e.b(0xFF); e.b(0x74); e.b(0x24); e.b(0x28); // push dword ptr [esp+0x28] (slot, c, b, a, carType0, outPart)
+        e.b(0xFF); e.b(0x74); e.b(0x24); e.b(0x28);
     }
-    e.b(0xB9); e.u32(g_nfsBase + 0x6ED1F8u);    // mov ecx, nfs.exe+6ED1F8 (00AED1F8)
-    e.callRel(g_nfsBase + 0x37F2E0u);           // call nfs.exe+37F2E0 (callee cleans 0x18)
-    e.b(0x0F); e.b(0xB6); e.b(0xC0);            // movzx eax, al
-    e.b(0x5F); e.b(0x5E); e.b(0x5D); e.b(0x5B); // pop edi, esi, ebp, ebx
+    e.b(0xB9); e.u32(g_nfsBase + 0x6ED1F8u);
+    e.callRel(g_nfsBase + 0x37F2E0u);
+    e.b(0x0F); e.b(0xB6); e.b(0xC0);
+    e.b(0x5F); e.b(0x5E); e.b(0x5D); e.b(0x5B);
+    e.b(0xC3);
+
+    // 0c. Helper: __cdecl uint32_t ThisCall0(targetFn, thisPtr)
+    g_callThis0 = reinterpret_cast<ThisCall0Fn>(e.curPtr());
+    e.b(0x53); e.b(0x55); e.b(0x56); e.b(0x57);
+    e.b(0x8B); e.b(0x44); e.b(0x24); e.b(0x14); // mov eax, [esp+0x14] (targetFn)
+    e.b(0x8B); e.b(0x4C); e.b(0x24); e.b(0x18); // mov ecx, [esp+0x18] (thisPtr)
+    e.b(0xFF); e.b(0xD0);                       // call eax
+    e.b(0x5F); e.b(0x5E); e.b(0x5D); e.b(0x5B);
+    e.b(0xC3);
+
+    // 0d. Helper: __cdecl uint32_t ThisCall1(targetFn, thisPtr, a1)
+    g_callThis1 = reinterpret_cast<ThisCall1Fn>(e.curPtr());
+    e.b(0x53); e.b(0x55); e.b(0x56); e.b(0x57);
+    e.b(0x8B); e.b(0x44); e.b(0x24); e.b(0x14); // mov eax, [esp+0x14]
+    e.b(0x8B); e.b(0x4C); e.b(0x24); e.b(0x18); // mov ecx, [esp+0x18]
+    e.b(0xFF); e.b(0x74); e.b(0x24); e.b(0x1C); // push dword ptr [esp+0x1C] (a1)
+    e.b(0xFF); e.b(0xD0);                       // call eax
+    e.b(0x5F); e.b(0x5E); e.b(0x5D); e.b(0x5B);
+    e.b(0xC3);
+
+    // 0e. Helper: __cdecl uint32_t ThisCall2(targetFn, thisPtr, a1, a2)
+    g_callThis2 = reinterpret_cast<ThisCall2Fn>(e.curPtr());
+    e.b(0x53); e.b(0x55); e.b(0x56); e.b(0x57);
+    e.b(0x8B); e.b(0x44); e.b(0x24); e.b(0x14); // mov eax, [esp+0x14]
+    e.b(0x8B); e.b(0x4C); e.b(0x24); e.b(0x18); // mov ecx, [esp+0x18]
+    e.b(0xFF); e.b(0x74); e.b(0x24); e.b(0x20); // push dword ptr [esp+0x20] (a2)
+    e.b(0xFF); e.b(0x74); e.b(0x24); e.b(0x20); // push dword ptr [esp+0x20] (a1)
+    e.b(0xFF); e.b(0xD0);                       // call eax
+    e.b(0x5F); e.b(0x5E); e.b(0x5D); e.b(0x5B);
     e.b(0xC3);
 
     // 1. Hook nfs.exe+2851B0 (5B)
@@ -579,17 +673,39 @@ static bool InstallAllHooks() {
     e.raw(orig10, 6);
     e.jmpRel(g_nfsBase + 0x386443u);
 
+    // 11. Hook nfs.exe+175F70 (5B: call 00402380 in Garage Dyno) — captures exact pvehArg!
+    uint32_t st11 = e.curAddr();
+    e.emitCallHandler(reinterpret_cast<void*>(&OnAttribInstCtor));
+    e.callRel(g_nfsBase + 0x2380u);
+    e.jmpRel(g_nfsBase + 0x175F75u);
+
+    // 12. Hook nfs.exe+1A4BE1 (5B: call 00402380 in TuningData) — captures exact pvehArg!
+    uint32_t st12 = e.curAddr();
+    e.emitCallHandler(reinterpret_cast<void*>(&OnAttribInstCtor));
+    e.callRel(g_nfsBase + 0x2380u);
+    e.jmpRel(g_nfsBase + 0x1A4BE6u);
+
+    // 13. Hook nfs.exe+133D50 (5B: push esi; mov esi, [esp+0C]) — FECarCareerEntry::BuildBlueprint!
+    uint32_t st13 = e.curAddr();
+    e.emitCallHandler(reinterpret_cast<void*>(&OnCareerBuildBp));
+    const uint8_t orig13[5] = { 0x56, 0x8B, 0x74, 0x24, 0x0C };
+    e.raw(orig13, 5);
+    e.jmpRel(g_nfsBase + 0x133D55u);
+
     bool ok = true;
-    ok = ok && InstallPatchJump(g_hooks[0], g_nfsBase + 0x2851B0u, st1, 5);
-    ok = ok && InstallPatchJump(g_hooks[1], g_nfsBase + 0x1AEB55u, st2, 6);
-    ok = ok && InstallPatchJump(g_hooks[2], g_nfsBase + 0x1AEC76u, st3, 6);
-    ok = ok && InstallPatchJump(g_hooks[3], g_nfsBase + 0x1F0863u, st4, 5);
-    ok = ok && InstallPatchJump(g_hooks[4], g_nfsBase + 0x31B680u, st5, 5);
-    ok = ok && InstallPatchJump(g_hooks[5], g_nfsBase + 0x38EBADu, st6, 9);
-    ok = ok && InstallPatchJump(g_hooks[6], g_nfsBase + 0x38A672u, st7, 8);
-    ok = ok && InstallPatchJump(g_hooks[7], g_nfsBase + 0x32E8DDu, st8, 7);
-    ok = ok && InstallPatchJump(g_hooks[8], g_nfsBase + 0x1F05D6u, st9, 6);
-    ok = ok && InstallPatchJump(g_hooks[9], g_nfsBase + 0x38643Du, st10, 6);
+    ok = ok && InstallPatchJump(g_hooks[0],  g_nfsBase + 0x2851B0u, st1,  5);
+    ok = ok && InstallPatchJump(g_hooks[1],  g_nfsBase + 0x1AEB55u, st2,  6);
+    ok = ok && InstallPatchJump(g_hooks[2],  g_nfsBase + 0x1AEC76u, st3,  6);
+    ok = ok && InstallPatchJump(g_hooks[3],  g_nfsBase + 0x1F0863u, st4,  5);
+    ok = ok && InstallPatchJump(g_hooks[4],  g_nfsBase + 0x31B680u, st5,  5);
+    ok = ok && InstallPatchJump(g_hooks[5],  g_nfsBase + 0x38EBADu, st6,  9);
+    ok = ok && InstallPatchJump(g_hooks[6],  g_nfsBase + 0x38A672u, st7,  8);
+    ok = ok && InstallPatchJump(g_hooks[7],  g_nfsBase + 0x32E8DDu, st8,  7);
+    ok = ok && InstallPatchJump(g_hooks[8],  g_nfsBase + 0x1F05D6u, st9,  6);
+    ok = ok && InstallPatchJump(g_hooks[9],  g_nfsBase + 0x38643Du, st10, 6);
+    ok = ok && InstallPatchJump(g_hooks[10], g_nfsBase + 0x175F70u, st11, 5);
+    ok = ok && InstallPatchJump(g_hooks[11], g_nfsBase + 0x1A4BE1u, st12, 5);
+    ok = ok && InstallPatchJump(g_hooks[12], g_nfsBase + 0x133D50u, st13, 5);
     if (!ok) RestoreAllHooks();
     return ok;
 }
@@ -646,7 +762,9 @@ struct WorkerState {
     };
     std::unordered_map<uint32_t, BpRecord> bpPool;
     std::unordered_map<uint32_t, CustRecInfo> custRecPool;
-    uint32_t lastRingSeqRead = 0, lastHeapScanTick = 0, lastStaticTabTick = 0;
+    std::unordered_map<uint32_t, uint32_t> pvehArgByCtHash;
+    uint32_t lastRingSeqRead = 0, lastHeapScanTick = 0, lastStaticTabTick = 0, lastCustScanTick = 0;
+    uint32_t lastCustScanCtHash = 0;
     uint32_t activeBpAddr = 0, pinnedBpAddr = 0, activeCustRecAddr = 0;
 
     std::string activeBaseHash, activeCanonHash, activeVarHash;
@@ -747,6 +865,16 @@ static bool EnsureVltIndexed(uint32_t seedPvehColl) {
     if (IsValidPtr(seedPvehColl)) {
         uint32_t cl = SafeReadU32(seedPvehColl + 0x14);
         if (IsValidPtr(cl) && SafeReadU32(cl + 0x04) == cl) seedCls = cl;
+    }
+    // Фолбэк при мгновенном старте (до смены авто): берём Attrib::Class* из любого Blueprint в статической таблице!
+    if (!IsValidPtr(seedCls)) {
+        for (const auto& kv : g_ws.bpPool) {
+            uint32_t p0 = SafeReadU32(kv.first + 0x6C);
+            if (IsValidPtr(p0)) {
+                uint32_t cl = SafeReadU32(p0 + 0x14);
+                if (IsValidPtr(cl) && SafeReadU32(cl + 0x04) == cl) { seedCls = cl; break; }
+            }
+        }
     }
     if (!IsValidPtr(seedCls)) return false;
     uint32_t dbPtr = SafeReadU32(seedCls + 0x28);
@@ -1188,6 +1316,252 @@ static void IngestBpRing() {
     }
 }
 
+
+// ============================================================================
+// Main-Thread Safe Execution (WH_GETMESSAGE) for 0077F2E0 & Live Dyno Recalc
+// ============================================================================
+static BOOL CALLBACK FindGameWindowProc(HWND hwnd, LPARAM lParam) {
+    DWORD pid = 0;
+    DWORD tid = GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == GetCurrentProcessId() && IsWindowVisible(hwnd) && GetWindow(hwnd, GW_OWNER) == nullptr) {
+        RECT r{};
+        if (GetClientRect(hwnd, &r) && (r.right - r.left) >= 320 && (r.bottom - r.top) >= 240) {
+            g_gameHwnd = hwnd;
+            g_mainTid  = tid;
+            *reinterpret_cast<bool*>(lParam) = true;
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static void ExecuteMainThreadJob() {
+    if (g_mtJob.type == MainThreadJob::JOB_FIND_PACKED16) {
+        g_mtJob.found = false;
+        if (!g_callLookupPart || g_mtJob.carType0 == 0) return;
+
+        auto tryABC = [&](uint32_t a, uint32_t b, uint32_t c, bool requireExactW1) -> bool {
+            uint32_t tmp[4] = { 0, 0, 0, 0 };
+            if (g_callLookupPart(reinterpret_cast<uint32_t>(tmp), g_mtJob.carType0, a, b, c, g_mtJob.feSlot) != 0) {
+                if ((tmp[0] & 0xFFu) != 0 && (tmp[2] & 0xFFFFu) == g_mtJob.targetIdx) {
+                    if (!requireExactW1 || !IsValidPtr(g_mtJob.targetW1) || tmp[1] == g_mtJob.targetW1) {
+                        g_mtJob.outPacked = static_cast<uint16_t>(((a & 0xFFu) << 8) | ((b & 0xFu) << 4) | (c & 0xFu));
+                        std::memcpy(g_mtJob.outDbPart, tmp, 16);
+                        g_mtJob.found = true;
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+
+        uint32_t curA = (g_mtJob.curPacked != 0xFFFFu) ? ((g_mtJob.curPacked >> 8) & 0xFFu) : 0u;
+        uint32_t curB = (g_mtJob.curPacked != 0xFFFFu) ? ((g_mtJob.curPacked >> 4) & 0xFu)  : 0u;
+        uint32_t idx  = g_mtJob.targetIdx & 0xFu;
+
+        for (int pass = 0; pass < 2; ++pass) {
+            bool exactW1 = (pass == 0);
+            // 1) Мгновенная проверка текущего 'a' (например 0x66 для двигателя) с новым c = targetIdx!
+            if (g_mtJob.curPacked != 0xFFFFu) {
+                if (tryABC(curA, curB, idx, exactW1)) return;
+                if (curB != 0 && tryABC(curA, 0, idx, exactW1)) return;
+                for (uint32_t b = 0; b < 16; ++b) if (tryABC(curA, b, idx, exactW1)) return;
+                for (uint32_t c = 0; c < 16; ++c) if (tryABC(curA, idx, c, exactW1)) return;
+            }
+            // 2) Полный перебор 'a' = 0..255 с (a, 0, targetIdx) — находит любую деталь даже из пустого слота 0xFFFF!
+            for (uint32_t a = 0; a < 256; ++a) {
+                if (tryABC(a, 0, idx, exactW1)) return;
+            }
+            // 3) Запасной перебор 'a' = 0..255 с b = 1..3 (варианты вроде Widebody / Carbon)
+            for (uint32_t b = 1; b <= 3; ++b) {
+                for (uint32_t a = 0; a < 256; ++a) {
+                    if (tryABC(a, b, idx, exactW1)) return;
+                }
+            }
+        }
+        return;
+    }
+
+    if (g_mtJob.type == MainThreadJob::JOB_RECALC_DYNO) {
+        if (!g_callThis0 || !g_callThis1 || !g_callThis2) return;
+        if (!IsValidPtr(g_mtJob.bpAddr) || g_mtJob.pvehArg == 0) return;
+
+        alignas(16) uint8_t attribInst[0x40] = {};
+        alignas(16) uint8_t ratingObj[0x200] = {};
+        alignas(16) uint8_t carWrap[0x40]    = {};
+
+        g_inSelfDynoRecalc = 1;
+        g_callThis2(g_nfsBase + 0x2380u, attribInst, g_mtJob.pvehArg, 0u);
+        if (*reinterpret_cast<uint32_t*>(attribInst) != 0) {
+            uint32_t okB = g_callThis2(g_nfsBase + 0x38EB80u, reinterpret_cast<void*>(g_mtJob.bpAddr),
+                                       reinterpret_cast<uint32_t>(attribInst), 1u);
+            if ((okB & 0xFFu) != 0) {
+                uint32_t modeVal = g_mtJob.mode;
+                if (modeVal > 3u) modeVal = 0u;
+                g_callThis1(g_nfsBase + 0x318C60u, ratingObj, reinterpret_cast<uint32_t>(&modeVal));
+                uint32_t collPtr = g_callThis1(g_nfsBase + 0x2420u, attribInst, 0u);
+                if (IsValidPtr(collPtr)) {
+                    uint32_t wrapPtr = g_callThis2(g_nfsBase + 0x26F0u, carWrap, collPtr, 0u);
+                    if (IsValidPtr(wrapPtr)) {
+                        // Вызывает 0072E890 -> срабатывает наш OnGarageMain и мгновенно обновляет P1..P7, V и Дино!
+                        g_callThis1(g_nfsBase + 0x32E890u, ratingObj, wrapPtr);
+                        g_callThis0(g_nfsBase + 0x18E3B0u, carWrap);
+                    }
+                }
+            }
+            g_callThis0(g_nfsBase + 0x1301F0u, attribInst);
+        }
+        g_inSelfDynoRecalc = 0;
+    }
+}
+
+static LRESULT CALLBACK MainThreadMsgHook(int code, WPARAM wParam, LPARAM lParam) {
+    if (code >= 0 && g_mtPending.load(std::memory_order_acquire) != 0) {
+        if (g_mtPending.exchange(0) != 0) {
+            ExecuteMainThreadJob();
+            if (g_hMtDoneEvt) SetEvent(g_hMtDoneEvt);
+        }
+    }
+    return CallNextHookEx(g_hMsgHook, code, wParam, lParam);
+}
+
+static bool EnsureMainThreadHook() {
+    if (g_hMsgHook && IsWindow(g_gameHwnd)) return true;
+    bool found = false;
+    EnumWindows(FindGameWindowProc, reinterpret_cast<LPARAM>(&found));
+    if (!found || g_mainTid == 0) return false;
+    if (!g_hMtDoneEvt) g_hMtDoneEvt = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    g_hMsgHook = SetWindowsHookExA(WH_GETMESSAGE, MainThreadMsgHook, g_hSelf, g_mainTid);
+    return g_hMsgHook != nullptr;
+}
+
+static bool RunMainThreadJob(DWORD timeoutMs = 450u) {
+    if (!EnsureMainThreadHook() || !g_hMtDoneEvt) return false;
+    ResetEvent(g_hMtDoneEvt);
+    g_mtPending.store(1, std::memory_order_release);
+    PostMessageA(g_gameHwnd, WM_NULL, 0, 0);
+    return WaitForSingleObject(g_hMtDoneEvt, timeoutMs) == WAIT_OBJECT_0;
+}
+
+static bool TriggerLiveDynoRecalc(uint32_t bpAddr) {
+    if (!IsValidPtr(bpAddr) || !IsValidBlueprint(bpAddr)) return false;
+    uint32_t ctHash = SafeReadU32(bpAddr);
+    uint32_t pvehArg = 0;
+    auto it = g_ws.pvehArgByCtHash.find(ctHash);
+    if (it != g_ws.pvehArgByCtHash.end()) pvehArg = it->second;
+    else if (g_lastPvehArg != 0 && (g_lastPvehArgBp == bpAddr || g_ws.activeBpAddr == bpAddr)) pvehArg = g_lastPvehArg;
+    if (pvehArg == 0) return false;
+
+    uint32_t modeV = SafeReadU32(bpAddr + 0x2050);
+    if (modeV > 3u) modeV = g_ws.activeMode;
+
+    g_mtJob = MainThreadJob{};
+    g_mtJob.type    = MainThreadJob::JOB_RECALC_DYNO;
+    g_mtJob.bpAddr  = bpAddr;
+    g_mtJob.pvehArg = pvehArg;
+    g_mtJob.mode    = modeV;
+    return RunMainThreadJob(500u);
+}
+
+// ============================================================================
+// Exact Career FECustomizationRecord Matcher & In-Process Scanner
+// Находит ВСЕ постоянные записи карьеры (UserProfile + копия Гаража),
+// строго соответствующие активному Blueprint (ctHash + mode + parts + sliders)!
+// ============================================================================
+static bool DoesCustRecMatchBp(uint32_t cr, uint32_t bp, uint32_t ctHash, uint32_t bpMode, const float bpSliders[NUM_SLIDERS], bool checkSliders) {
+    if (!IsLiveCustRec(cr, ctHash)) return false;
+    uint32_t crMode = SafeReadU32(cr + 0x228);
+    if (crMode > 3u || (bpMode <= 3u && crMode != bpMode)) return false;
+
+    // 1. Все 32 ползунка в [cr+0x730..0x7AF] должны быть валидными float в [-1.05..+1.05]
+    float crSliders[32] = {};
+    if (!SafeRead(cr + 0x730u, crSliders, sizeof(crSliders))) return false;
+    for (int k = 0; k < 32; ++k) {
+        if (!IsFiniteFloat(crSliders[k]) || std::fabs(crSliders[k]) > 1.05f) return false;
+    }
+    if (checkSliders && bpSliders) {
+        for (int i = 0; i < NUM_SLIDERS; ++i) {
+            if (std::fabs(crSliders[SLIDER_DEFS[i].bpIdx] - bpSliders[i]) > 0.03f) return false;
+        }
+    }
+
+    // 2. Проверка 7 слотов прокачки: низшие 4 бита packed16 должны совпадать с w2 & 0xF в Blueprint!
+    //    Отсеивает и чужие конфиги 2/3 той же машины, и ложные совпадения (RideInfo с мусором 4F40/174B)!
+    int matchedNonZero = 0;
+    for (int i = 0; i < 7; ++i) {
+        uint32_t feSlot = INSPECT_SLOT_DEFS[i].feSlot;
+        uint32_t bpW2   = SafeReadU32(bp + 0x58u + feSlot * 0x10u + 8u);
+        uint32_t bpIdx  = bpW2 & 0xFFFFu;
+        uint16_t p16    = 0xFFFFu;
+        if (!SafeRead(cr + 0x34u + feSlot * 2u, &p16, 2)) return false;
+        if (bpIdx > 0u) {
+            if (p16 == 0xFFFFu || p16 == 0x0000u) return false;
+            if ((p16 & 0xFu) != (bpIdx & 0xFu)) return false;
+            if (((p16 >> 4) & 0xFu) > 3u) return false; // защита от мусора 4F40/174B!
+            matchedNonZero++;
+        } else {
+            if (p16 != 0xFFFFu && p16 != 0x0000u) {
+                if ((p16 & 0xFu) != 0u || ((p16 >> 4) & 0xFu) > 3u) return false;
+            }
+        }
+    }
+    (void)matchedNonZero;
+    return true;
+}
+
+static int ScanHeapForCustRecs(uint32_t activeBp, bool force) {
+    if (!IsValidPtr(activeBp) || !IsValidBlueprint(activeBp)) return 0;
+    uint32_t ctHash = SafeReadU32(activeBp);
+    if (ctHash == 0) return 0;
+
+    uint32_t now = GetTickCount();
+    if (!force && ctHash == g_ws.lastCustScanCtHash && (now - g_ws.lastCustScanTick) < 2500u) return 0;
+    g_ws.lastCustScanTick = now;
+    g_ws.lastCustScanCtHash = ctHash;
+
+    uint32_t bpMode = SafeReadU32(activeBp + 0x2050);
+    float bpSliders[NUM_SLIDERS] = {}; int dummyNz = 0;
+    bool hasSl = ReadSlidersFromBp(activeBp, bpSliders, dummyNz);
+
+    int found = 0;
+    std::vector<uint8_t> buf(65536 + 16);
+    uint32_t addr = 0x00400000u;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    while (addr < 0x7FFF0000u && !g_stopWorker.load()) {
+        if (!VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi))) { addr += 0x10000u; continue; }
+        uint32_t regBase = reinterpret_cast<uint32_t>(mbi.BaseAddress);
+        uint32_t regSize = static_cast<uint32_t>(mbi.RegionSize);
+        uint32_t nextAddr = (regBase + regSize > addr) ? (regBase + regSize) : (addr + 0x10000u);
+
+        bool rw = (mbi.State == MEM_COMMIT) &&
+                  ((mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0) &&
+                  ((mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0) &&
+                  (regSize >= 0x1000u) && (regSize <= 128u * 1024u * 1024u);
+        if (rw) {
+            for (uint32_t chunkOff = 0; chunkOff < regSize; chunkOff += 65536u) {
+                uint32_t chunkAddr = regBase + chunkOff;
+                uint32_t toRead = std::min(65536u, regSize - chunkOff);
+                if (toRead < 4u) break;
+                SIZE_T br = 0;
+                if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(chunkAddr), buf.data(), toRead, &br) || br < 4u) continue;
+                for (size_t off = 0; off + 4 <= br; off += 4) {
+                    if (*reinterpret_cast<const uint32_t*>(buf.data() + off) != ctHash) continue;
+                    uint32_t hitAddr = chunkAddr + static_cast<uint32_t>(off);
+                    if (hitAddr < 0x00400800u) continue;
+                    uint32_t cr = hitAddr - 0x7B0u;
+                    if (g_ws.custRecPool.find(cr) != g_ws.custRecPool.end()) continue;
+                    if (DoesCustRecMatchBp(cr, activeBp, ctHash, bpMode, hasSl ? bpSliders : nullptr, hasSl)) {
+                        RegisterCustRec(cr, activeBp, g_directCustSeq + 1);
+                        found++;
+                    }
+                }
+            }
+        }
+        addr = nextAddr;
+    }
+    return found;
+}
+
 static void ProbeLivePointersForBp(uint32_t carPtr, uint32_t ratingPtr) {
     uint32_t roots[5] = { carPtr, g_playerCarPtr, g_playerObjPtr, g_tuningDataPtr, ratingPtr };
     std::unordered_set<uint32_t> seen;
@@ -1531,15 +1905,30 @@ static void HandleCommand(
         newVal = std::max(-1.0f, std::min(1.0f, newVal));
         bool wrote = false;
 
-        // 1. Запись напрямую в сохранение карьеры: [FECustomizationRecord + 0x730 + bpIdx * 4]!
+        // 1. Запись напрямую во ВСЕ постоянные записи карьеры активной машины ([FECustomizationRecord + 0x730 + bpIdx * 4])!
         uint32_t curCarType0 = (IsValidPtr(g_ws.activeBpAddr) && IsValidBlueprint(g_ws.activeBpAddr)) ? SafeReadU32(g_ws.activeBpAddr) : 0u;
         if (curCarType0 != 0) {
+            uint32_t bpMode = SafeReadU32(g_ws.activeBpAddr + 0x2050);
+            float bpSl[NUM_SLIDERS] = {}; int dNz = 0;
+            bool hasSl = ReadSlidersFromBp(g_ws.activeBpAddr, bpSl, dNz);
+            std::vector<uint32_t> matchedCrs;
             for (auto it = g_ws.custRecPool.begin(); it != g_ws.custRecPool.end(); ) {
                 if (!IsLiveCustRec(it->first, 0)) { it = g_ws.custRecPool.erase(it); continue; }
-                if (it->second.carType0 == curCarType0) {
-                    if (SafeWriteF32(it->first + 0x730u + bpIdx * 4u, newVal)) wrote = true;
+                if (it->second.carType0 == curCarType0 && DoesCustRecMatchBp(it->first, g_ws.activeBpAddr, curCarType0, bpMode, hasSl ? bpSl : nullptr, false)) {
+                    matchedCrs.push_back(it->first);
                 }
                 ++it;
+            }
+            if (matchedCrs.empty()) {
+                ScanHeapForCustRecs(g_ws.activeBpAddr, true);
+                for (const auto& kv : g_ws.custRecPool) {
+                    if (kv.second.carType0 == curCarType0 && DoesCustRecMatchBp(kv.first, g_ws.activeBpAddr, curCarType0, bpMode, hasSl ? bpSl : nullptr, false)) {
+                        matchedCrs.push_back(kv.first);
+                    }
+                }
+            }
+            for (uint32_t cr : matchedCrs) {
+                if (SafeWriteF32(cr + 0x730u + bpIdx * 4u, newVal)) wrote = true;
             }
         }
 
@@ -1588,6 +1977,7 @@ static void HandleCommand(
         int sIdx = findSliderIndexByHash(p1);
         if (sIdx < 0) return;
         bool wrote = writeOneSlider(sIdx, fp, g_shm->sliders[sIdx].value);
+        if (wrote) TriggerLiveDynoRecalc(g_ws.activeBpAddr);
         g_ws.lastActiveActivityTick = GetTickCount();
         g_ws.lastFastPubHash = 0;
         g_shm->cmdResultOk = wrote ? 1u : 0u;
@@ -1600,6 +1990,7 @@ static void HandleCommand(
                 if (writeOneSlider(i, 0.0f, g_shm->sliders[i].value)) resetCnt++;
             }
         }
+        if (resetCnt > 0) TriggerLiveDynoRecalc(g_ws.activeBpAddr);
         g_ws.lastActiveActivityTick = GetTickCount();
         g_ws.lastFastPubHash = 0;
         g_shm->cmdResultOk = (resetCnt > 0) ? 1u : 0u;
@@ -1609,8 +2000,11 @@ static void HandleCommand(
     }
     if (cmdType == CMD_INSTALL_PART) {
         if (p1 >= NUM_INSPECT_SLOTS) return;
-        uint32_t slotNum = INSPECT_SLOT_DEFS[p1].slot, idx = p2;
-        // Принудительно находим ВСЕ живые копии Blueprint в памяти (Гараж + рабочая копия Тюнинга/Магазина)
+        uint32_t slotNum = INSPECT_SLOT_DEFS[p1].slot;
+        uint32_t feSlot  = INSPECT_SLOT_DEFS[p1].feSlot; // ИСТИННЫЙ слот (0..164) в bp+0x58 и FECustomizationRecord+0x34!
+        uint32_t idx = p2;
+
+        // 1. Принудительно находим ВСЕ живые копии Blueprint и постоянные FECustomizationRecord текущей машины
         ScanHeapForBlueprints(true);
         bool filterPlayerOnly = (g_raceDayActive != 0);
         std::vector<uint32_t> bps = CollectMatchingBps(g_ws.activeCanonHash, filterPlayerOnly);
@@ -1620,96 +2014,99 @@ static void HandleCommand(
             std::snprintf(g_shm->cmdResultMsg, sizeof(g_shm->cmdResultMsg), "Нет активного Blueprint — открой авто в Гараже или нажми [Найти BP]");
             return;
         }
+        uint32_t primaryBp = IsValidBlueprint(g_ws.activeBpAddr) ? g_ws.activeBpAddr : bps[0];
+        uint32_t bpCarType0 = SafeReadU32(primaryBp);
+        uint32_t bpMode = SafeReadU32(primaryBp + 0x2050);
+        float bpSl[NUM_SLIDERS] = {}; int dNz = 0;
+        bool hasSl = ReadSlidersFromBp(primaryBp, bpSl, dNz);
+
+        ScanHeapForCustRecs(primaryBp, true);
+
         uint32_t vltSlotPtr = 0, vltRearBrakePtr = 0;
         auto itCar = g_ws.vltCars.find(g_ws.activeCanonHash);
         if (itCar != g_ws.vltCars.end()) { vltSlotPtr = itCar->second.slotPtr[p1]; vltRearBrakePtr = itCar->second.rearBrakePtr; }
 
-        // Ищем точную 16-битную упаковку (a<<8 | b<<4 | c) через родную nfs.exe+37F2E0 для записи в карьеру (FECustomizationRecord)!
-        uint32_t bpCarType0 = SafeReadU32(bps[0]);
-        auto findPacked16 = [&](uint32_t targetSlot, uint32_t targetW1, uint32_t targetIdx, uint16_t curPacked, uint16_t& outPacked, uint32_t outDbPart[4]) -> bool {
-            if (!g_callLookupPart || bpCarType0 == 0) return false;
-            auto tryABC = [&](uint32_t a, uint32_t b, uint32_t c, bool requireExactW1) -> bool {
-                uint32_t tmp[4] = { 0, 0, 0, 0 };
-                if (g_callLookupPart(reinterpret_cast<uint32_t>(tmp), bpCarType0, a, b, c, targetSlot) != 0) {
-                    if ((tmp[0] & 0xFFu) != 0 && (tmp[2] & 0xFFFFu) == targetIdx) {
-                        if (!requireExactW1 || !IsValidPtr(targetW1) || tmp[1] == targetW1) {
-                            outPacked = static_cast<uint16_t>(((a & 0xFFu) << 8) | ((b & 0xFu) << 4) | (c & 0xFu));
-                            std::memcpy(outDbPart, tmp, 16);
-                            return true;
-                        }
+        uint32_t rearBrakeFeSlot = 0;
+        if (feSlot == 10u) {
+            for (uint32_t rs = 9u; rs <= 13u; ++rs) {
+                if (rs == 10u) continue;
+                uint32_t rW1 = SafeReadU32(primaryBp + 0x58u + rs * 0x10u + 4u);
+                if (IsValidPtr(rW1)) {
+                    uint32_t rPl = SafeReadU32(rW1 + 0x18);
+                    if (IsValidPtr(rPl) && TryReadAsciiSafe(SafeReadU32(rPl + 0x10)) == "BRAKE_REAR") {
+                        rearBrakeFeSlot = rs;
+                        break;
                     }
                 }
-                return false;
-            };
-            uint32_t curA = (curPacked != 0xFFFFu) ? ((curPacked >> 8) & 0xFFu) : 0u;
-            uint32_t curB = (curPacked != 0xFFFFu) ? ((curPacked >> 4) & 0xFu)  : 0u;
-            uint32_t curC = (curPacked != 0xFFFFu) ? (curPacked & 0xFu)         : 0u;
+            }
+        }
 
-            for (int pass = 0; pass < 2; ++pass) {
-                bool exactW1 = (pass == 0);
-                // 1) Быстрый перебор по b (0..15) с текущими a, c
-                for (uint32_t b = 0; b < 16; ++b) if (tryABC(curA, b, curC, exactW1)) return true;
-                // 2) Перебор по a (0..31) с текущими b, c и с (0,0)
-                for (uint32_t a = 0; a < 32; ++a) if (tryABC(a, curB, curC, exactW1)) return true;
-                for (uint32_t a = 0; a < 32; ++a) if (tryABC(a, 0, 0, exactW1)) return true;
-                // 3) Полный перебор a (0..31) x b (0..15) при c = 0 и curC
-                for (uint32_t a = 0; a < 32; ++a) {
-                    for (uint32_t b = 0; b < 16; ++b) {
-                        if (tryABC(a, b, 0, exactW1)) return true;
-                        if (curC != 0 && tryABC(a, b, curC, exactW1)) return true;
-                    }
+        // Собираем ТОЛЬКО записи карьеры, соответствующие текущему Blueprint (UserProfile + копия Гаража)
+        std::vector<uint32_t> targetCrs;
+        for (auto it = g_ws.custRecPool.begin(); it != g_ws.custRecPool.end(); ) {
+            if (!IsLiveCustRec(it->first, 0)) { it = g_ws.custRecPool.erase(it); continue; }
+            if (it->second.carType0 == bpCarType0 && DoesCustRecMatchBp(it->first, primaryBp, bpCarType0, bpMode, hasSl ? bpSl : nullptr, hasSl)) {
+                targetCrs.push_back(it->first);
+            }
+            ++it;
+        }
+        // Если строгая проверка ползунков не нашла (напр., ползунки уже редактировались), смягчаем только проверку ползунков
+        if (targetCrs.empty()) {
+            for (const auto& kv : g_ws.custRecPool) {
+                if (kv.second.carType0 == bpCarType0 && DoesCustRecMatchBp(kv.first, primaryBp, bpCarType0, bpMode, nullptr, false)) {
+                    targetCrs.push_back(kv.first);
                 }
+            }
+        }
+
+        // 2. Ищем точный 16-битный код (a<<8 | b<<4 | c) через родную 0077F2E0 на ГЛАВНОМ потоке игры!
+        auto findPacked16Safe = [&](uint32_t targetFeSlot, uint32_t targetW1, uint32_t targetIdx, uint16_t curPacked, uint16_t& outPacked, uint32_t outDbPart[4]) -> bool {
+            g_mtJob = MainThreadJob{};
+            g_mtJob.type      = MainThreadJob::JOB_FIND_PACKED16;
+            g_mtJob.carType0  = bpCarType0;
+            g_mtJob.feSlot    = targetFeSlot;
+            g_mtJob.targetW1  = targetW1;
+            g_mtJob.targetIdx = targetIdx;
+            g_mtJob.curPacked = curPacked;
+            if (RunMainThreadJob(500u) && g_mtJob.found) {
+                outPacked = g_mtJob.outPacked;
+                std::memcpy(outDbPart, g_mtJob.outDbPart, 16);
+                return true;
             }
             return false;
         };
 
-        // 1. Обновляем все живые записи карьеры (FECustomizationRecord + 0x34 + slot * 2)
-        int custApplied = 0;
+        uint16_t seedCurP = 0xFFFFu;
+        if (!targetCrs.empty()) SafeRead(targetCrs[0] + 0x34u + feSlot * 2u, &seedCurP, 2);
+
+        uint16_t newMainP16 = 0xFFFFu;
         uint32_t verifiedDbPart[4] = {};
-        bool haveVerifiedPart = false;
-        uint32_t rearBrakeSlotNum = 0;
-        for (uint32_t rs = 8; rs <= 12 && slotNum == 9; ++rs) {
-            if (rs == 9) continue;
-            uint32_t rW1 = SafeReadU32(bps[0] + 0x68u + rs * 0x10u + 4);
-            if (IsValidPtr(rW1)) {
-                uint32_t rPl = SafeReadU32(rW1 + 0x18);
-                if (IsValidPtr(rPl) && TryReadAsciiSafe(SafeReadU32(rPl + 0x10)) == "BRAKE_REAR") {
-                    rearBrakeSlotNum = rs;
-                    break;
+        bool haveVerifiedPart = findPacked16Safe(feSlot, vltSlotPtr, idx, seedCurP, newMainP16, verifiedDbPart);
+
+        uint16_t newRearP16 = 0xFFFFu;
+        uint32_t verifiedRearPart[4] = {};
+        bool haveVerifiedRear = false;
+        if (feSlot == 10u && rearBrakeFeSlot != 0) {
+            uint16_t seedRearP = 0xFFFFu;
+            if (!targetCrs.empty()) SafeRead(targetCrs[0] + 0x34u + rearBrakeFeSlot * 2u, &seedRearP, 2);
+            haveVerifiedRear = findPacked16Safe(rearBrakeFeSlot, vltRearBrakePtr, idx, seedRearP, newRearP16, verifiedRearPart);
+        }
+
+        // 3. Пишем подтверждённый 16-битный код во ВСЕ постоянные FECustomizationRecord (UserProfile + Гараж)
+        int custApplied = 0;
+        if (haveVerifiedPart) {
+            for (uint32_t cr : targetCrs) {
+                if (SafeWrite(cr + 0x34u + feSlot * 2u, &newMainP16, 2)) custApplied++;
+                if (haveVerifiedRear && rearBrakeFeSlot != 0) {
+                    SafeWrite(cr + 0x34u + rearBrakeFeSlot * 2u, &newRearP16, 2);
                 }
             }
         }
 
-        for (auto it = g_ws.custRecPool.begin(); it != g_ws.custRecPool.end(); ) {
-            if (!IsLiveCustRec(it->first, 0)) { it = g_ws.custRecPool.erase(it); continue; }
-            if (it->second.carType0 == bpCarType0) {
-                uint32_t cr = it->first;
-                uint16_t curP = 0xFFFFu;
-                SafeRead(cr + 0x34u + slotNum * 2u, &curP, 2);
-                uint16_t newP = 0xFFFFu;
-                uint32_t tmpPart[4] = {};
-                if (findPacked16(slotNum, vltSlotPtr, idx, curP, newP, tmpPart)) {
-                    if (SafeWrite(cr + 0x34u + slotNum * 2u, &newP, 2)) {
-                        custApplied++;
-                        if (!haveVerifiedPart) { std::memcpy(verifiedDbPart, tmpPart, 16); haveVerifiedPart = true; }
-                    }
-                }
-                if (slotNum == 9 && rearBrakeSlotNum != 0) {
-                    uint16_t curRP = 0xFFFFu, newRP = 0xFFFFu;
-                    uint32_t tmpR[4] = {};
-                    SafeRead(cr + 0x34u + rearBrakeSlotNum * 2u, &curRP, 2);
-                    if (findPacked16(rearBrakeSlotNum, vltRearBrakePtr, idx, curRP, newRP, tmpR)) {
-                        SafeWrite(cr + 0x34u + rearBrakeSlotNum * 2u, &newRP, 2);
-                    }
-                }
-            }
-            ++it;
-        }
-
-        // 2. Обновляем все живые копии Blueprint (Гараж + Тюнинг + Стайлинг)
+        // 4. Обновляем ВСЕ живые копии Blueprint (bp + 0x58 + feSlot * 0x10)
         int applied = 0; bool rearSynced = false;
         for (uint32_t bp : bps) {
-            uint32_t off = 0x68u + slotNum * 0x10u;
+            uint32_t off = 0x58u + feSlot * 0x10u;
             if (haveVerifiedPart) {
                 verifiedDbPart[0] = (verifiedDbPart[0] & 0xFFFFFF00u) | 1u;
                 SafeWrite(bp + off, verifiedDbPart, 16);
@@ -1735,21 +2132,31 @@ static void HandleCommand(
                 applied++;
             }
 
-            if (slotNum == 9 && rearBrakeSlotNum != 0) {
-                uint32_t rOff = 0x68u + rearBrakeSlotNum * 0x10u;
-                uint32_t rW1 = SafeReadU32(bp + rOff + 0x04);
-                uint32_t dArr = 0, rCnt = 0;
-                if (IsValidPtr(rW1)) GetPartPhysicsArrayInfo(rW1, dArr, rCnt);
-                if ((rCnt <= idx || (idx > 0 && rCnt <= 1)) && IsValidPtr(vltRearBrakePtr)) {
-                    SafeWriteU32(bp + rOff + 0x04, vltRearBrakePtr);
-                    GetPartPhysicsArrayInfo(vltRearBrakePtr, dArr, rCnt);
-                }
-                if (rCnt == 0 || idx < rCnt) {
-                    SafeWriteU32(bp + rOff + 0x08, (SafeReadU32(bp + rOff + 0x08) & 0xFFFF0000u) + idx);
+            if (feSlot == 10u && rearBrakeFeSlot != 0) {
+                uint32_t rOff = 0x58u + rearBrakeFeSlot * 0x10u;
+                if (haveVerifiedRear) {
+                    verifiedRearPart[0] = (verifiedRearPart[0] & 0xFFFFFF00u) | 1u;
+                    SafeWrite(bp + rOff, verifiedRearPart, 16);
                     rearSynced = true;
+                } else {
+                    uint32_t rW1 = SafeReadU32(bp + rOff + 0x04);
+                    uint32_t dArr = 0, rCnt = 0;
+                    if (IsValidPtr(rW1)) GetPartPhysicsArrayInfo(rW1, dArr, rCnt);
+                    if ((rCnt <= idx || (idx > 0 && rCnt <= 1)) && IsValidPtr(vltRearBrakePtr)) {
+                        SafeWriteU32(bp + rOff + 0x04, vltRearBrakePtr);
+                        GetPartPhysicsArrayInfo(vltRearBrakePtr, dArr, rCnt);
+                    }
+                    if (rCnt == 0 || idx < rCnt) {
+                        SafeWriteU32(bp + rOff + 0x08, (SafeReadU32(bp + rOff + 0x08) & 0xFFFF0000u) + idx);
+                        rearSynced = true;
+                    }
                 }
             }
         }
+
+        // 5. Мгновенный живой пересчёт диностенда на главном потоке (обновляет колонку «Текущее» сразу!)
+        bool dynoOk = TriggerLiveDynoRecalc(primaryBp);
+
         if (!inTuningUi) { g_ws.curBounds.clear(); g_ws.hasLiveBounds = false; }
         g_ws.lastCatalogKeyHash = 0;
         g_ws.lastUpgKeyHash = 0;
@@ -1757,8 +2164,9 @@ static void HandleCommand(
         g_ws.lastActiveActivityTick = GetTickCount();
         g_shm->cmdResultOk = 1;
         std::snprintf(g_shm->cmdResultMsg, sizeof(g_shm->cmdResultMsg),
-                      "Установлено [%s]: w2=%u%s (BP: %d | Карьера: %d)",
-                      INSPECT_SLOT_DEFS[p1].nameUtf8, idx, rearSynced ? " + зад. тормоза" : "", applied, custApplied);
+                      "Установлено [%s]: w2=%u%s (BP:%d | Карьера:%d%s)",
+                      INSPECT_SLOT_DEFS[p1].nameUtf8, idx, rearSynced ? " + зад." : "",
+                      applied, custApplied, dynoOk ? " | Дино OK" : "");
     }
 }
 
@@ -1787,6 +2195,22 @@ static DWORD WINAPI WorkerThreadProc(LPVOID) {
             if (g_hookSnapSeq == s1) { localSnap = tmp; lastSeenHookSeq = s1; haveSnap = true; }
         }
 
+        // Сначала читаем статическую таблицу RideInfo (nfs.exe+6EAA48) и проиндексируем VLT,
+        // чтобы активное авто, BP, детали и ползунки появились МГНОВЕННО при запуске без смены авто!
+        IngestBpRing();
+        if (!g_ws.vltReady) {
+            EnsureVltIndexed(haveSnap ? localSnap.pvehCollPtr : 0u);
+        }
+
+        // Запоминаем pvehArg для активного ctHash (для живого пересчёта колонки «Текущее»)
+        if (g_lastPvehArg != 0) {
+            uint32_t refBp = IsValidBlueprint(g_lastPvehArgBp) ? g_lastPvehArgBp : g_ws.activeBpAddr;
+            if (IsValidBlueprint(refBp)) {
+                uint32_t ct = SafeReadU32(refBp);
+                if (ct != 0) g_ws.pvehArgByCtHash[ct] = g_lastPvehArg;
+            }
+        }
+
         std::string baseHash, varHash, chainStr;
         if (haveSnap) {
             std::vector<std::string> staticNodes, fullStatic;
@@ -1807,7 +2231,25 @@ static DWORD WINAPI WorkerThreadProc(LPVOID) {
                 if (i > 0) chainStr += " -> ";
                 chainStr += fullStatic[i];
             }
-            if (!g_ws.vltReady) EnsureVltIndexed(localSnap.pvehCollPtr);
+        } else if (g_ws.vltReady) {
+            // Мгновенный автодетект активного авто из статической таблицы (nfs.exe+6EAA54/50/4C) ДО первого кадра дино!
+            uint32_t bootBp = 0;
+            uint32_t statAddrs[3] = { g_nfsBase + 0x6EAA54u, g_nfsBase + 0x6EAA50u, g_nfsBase + 0x6EAA4Cu };
+            for (uint32_t sa : statAddrs) {
+                uint32_t p = SafeReadU32(sa);
+                if (IsValidBlueprint(p)) { bootBp = p; break; }
+            }
+            if (bootBp != 0) {
+                uint32_t bt = GetBpCarTypeId(bootBp);
+                std::string idHash = IdentifyBpCarModel(bootBp, bt);
+                if (!idHash.empty()) {
+                    baseHash = idHash;
+                    varHash  = idHash;
+                    chainStr = idHash + " (BP-старт)";
+                    uint32_t bm = SafeReadU32(bootBp + 0x2050);
+                    if (bm <= 3u) localSnap.carMode = bm;
+                }
+            }
         }
 
         std::string canonHash = ProStreetMeta::canonicalCarHash(baseHash);
@@ -1998,16 +2440,29 @@ static DWORD WINAPI WorkerThreadProc(LPVOID) {
         }
         if (slidersMoved) g_ws.lastActiveActivityTick = now;
 
-        // Count live Career records (FECustomizationRecord) matching current carType0
+        // Count & auto-discover live Career records (FECustomizationRecord) matching activeBp
         uint32_t curBpType0 = (activeBp != 0) ? SafeReadU32(activeBp) : 0u;
-        uint32_t bestCr = 0, bestCrSeq = 0, matchCrCnt = 0;
-        for (auto it = g_ws.custRecPool.begin(); it != g_ws.custRecPool.end(); ) {
-            if (!IsLiveCustRec(it->first, 0)) { it = g_ws.custRecPool.erase(it); continue; }
-            if (curBpType0 != 0 && it->second.carType0 == curBpType0) {
-                matchCrCnt++;
-                if (it->second.lastSeq >= bestCrSeq) { bestCrSeq = it->second.lastSeq; bestCr = it->first; }
+        uint32_t curBpMode  = (activeBp != 0) ? SafeReadU32(activeBp + 0x2050) : 0u;
+        auto countMatchedCrs = [&](uint32_t& outBest, uint32_t& outBestSeq) -> uint32_t {
+            outBest = 0; outBestSeq = 0;
+            uint32_t cnt = 0;
+            for (auto it = g_ws.custRecPool.begin(); it != g_ws.custRecPool.end(); ) {
+                if (!IsLiveCustRec(it->first, 0)) { it = g_ws.custRecPool.erase(it); continue; }
+                if (curBpType0 != 0 && it->second.carType0 == curBpType0 &&
+                    DoesCustRecMatchBp(it->first, activeBp, curBpType0, curBpMode, nullptr, false)) {
+                    cnt++;
+                    if (it->second.lastSeq >= outBestSeq) { outBestSeq = it->second.lastSeq; outBest = it->first; }
+                }
+                ++it;
             }
-            ++it;
+            return cnt;
+        };
+        uint32_t bestCr = 0, bestCrSeq = 0;
+        uint32_t matchCrCnt = (activeBp != 0) ? countMatchedCrs(bestCr, bestCrSeq) : 0u;
+        if (activeBp != 0 && matchCrCnt == 0) {
+            if (ScanHeapForCustRecs(activeBp, false) > 0) {
+                matchCrCnt = countMatchedCrs(bestCr, bestCrSeq);
+            }
         }
         g_ws.activeCustRecAddr = bestCr;
 
@@ -2185,8 +2640,10 @@ static DWORD WINAPI WorkerThreadProc(LPVOID) {
         }
     }
 
+    if (g_hMsgHook) { UnhookWindowsHookEx(g_hMsgHook); g_hMsgHook = nullptr; }
     RestoreAllHooks();
     Sleep(60);
+    if (g_hMtDoneEvt) { CloseHandle(g_hMtDoneEvt); g_hMtDoneEvt = nullptr; }
     if (g_trampMem) { VirtualFree(g_trampMem, 0, MEM_RELEASE); g_trampMem = nullptr; }
     if (g_shm) { g_shm->dllUnloaded = 1; UnmapViewOfFile(g_shm); g_shm = nullptr; }
     if (g_hCmdEvent) { CloseHandle(g_hCmdEvent); g_hCmdEvent = nullptr; }

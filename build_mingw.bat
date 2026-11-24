@@ -3,7 +3,7 @@ chcp 65001 >nul
 setlocal
 
 echo ============================================================
-echo   statsEdps v1.0.4 - MinGW-w64 x86 (32-bit) Build Script
+echo   statsEdps v1.0.5 - MinGW-w64 x86 (32-bit) Build Script
 echo ============================================================
 
 set "CXX="

@@ -154,11 +154,12 @@ struct Databases {
     int statTotal = 0, statFullAll = 0, statGrip = 0, statDrift = 0, statDrag = 0, statSpeed = 0;
 
     void initPaths() {
-        cfgIniPath = GetAppDataDirUtf8() + "\\statsEdps_paths.ini";
-        // По умолчанию всегда загружаем встроенные базы (76/76); внешний .lua подхватится, только если задан в statsEdps_paths.ini
-        loadConfig();
-        loadStockDB(false);
-        loadProfilesDB(false);
+        cfgIniPath = GetAppDataDirUtf8() + "\\statsEdps_v105.ini";
+        // В v1.0.5 обе базы (76/76) вшиты напрямую в statsEdps.exe — старые пути от v1.0.3 игнорируются!
+        stockDbPath.clear();
+        profilesDbPath.clear();
+        loadEmbeddedStockDB();
+        loadEmbeddedProfilesDB();
     }
 
     void loadConfig() {
