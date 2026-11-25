@@ -11,6 +11,32 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Detect source folder and version
+        shell: pwsh
+        run: |
+          $hasSub  = Test-Path "statsEdps\common\version.h"
+          $hasRoot = Test-Path "common\version.h"
+          if ($hasSub -and $hasRoot) {
+            Write-Error "В репозитории ДВЕ копии исходников (и в корне, и в папке statsEdps/)! Удали лишнюю старую папку."
+            exit 1
+          }
+          if ($hasSub) {
+            $srcDir = "statsEdps"
+          } elseif ($hasRoot) {
+            $srcDir = "."
+          } else {
+            Write-Error "Не найден common\version.h! Убедись, что залита версия v1.0.5+."
+            exit 1
+          }
+          $verFile = Get-Content (Join-Path $srcDir "common\version.h") -Raw
+          $maj = [regex]::Match($verFile, 'STATSEDPS_VER_MAJOR\s+(\d+)').Groups[1].Value
+          $min = [regex]::Match($verFile, 'STATSEDPS_VER_MINOR\s+(\d+)').Groups[1].Value
+          $pat = [regex]::Match($verFile, 'STATSEDPS_VER_PATCH\s+(\d+)').Groups[1].Value
+          $ver = "$maj.$min.$pat"
+          Write-Host "=== Сборка statsEdps v$ver из папки: $srcDir ==="
+          "SRC_DIR=$srcDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "APP_VER=$ver"    | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Setup MSVC x86 (32-bit)
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -19,17 +45,21 @@ jobs:
       - name: Compile statsEdps (x86)
         shell: cmd
         run: |
-          if exist "statsEdps\hook_dll\statsEdps_hooks.cpp" cd statsEdps
+          cd /d "%SRC_DIR%"
           if not exist bin mkdir bin
-          cl /nologo /std:c++17 /O2 /MT /EHsc /utf-8 /D_CRT_SECURE_NO_WARNINGS /LD /I common hook_dll\statsEdps_hooks.cpp /Fe:bin\statsEdps_hooks.dll /Fo:bin\ /link /NOLOGO user32.lib kernel32.lib
+          rc /nologo /I common /DSTATSEDPS_IS_DLL /fo bin\ver_dll.res common\version.rc
           if errorlevel 1 exit /b 1
-          cl /nologo /std:c++17 /O2 /MT /EHsc /utf-8 /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /I common app_exe\main_app.cpp /Fe:bin\statsEdps.exe /Fo:bin\ /link /NOLOGO /SUBSYSTEM:WINDOWS user32.lib gdi32.lib comdlg32.lib advapi32.lib kernel32.lib
+          rc /nologo /I common /fo bin\ver_exe.res common\version.rc
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++17 /O2 /MT /EHsc /utf-8 /D_CRT_SECURE_NO_WARNINGS /LD /I common hook_dll\statsEdps_hooks.cpp bin\ver_dll.res /Fe:bin\statsEdps_hooks.dll /Fo:bin\ /link /NOLOGO user32.lib kernel32.lib
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++17 /O2 /MT /EHsc /utf-8 /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /I common app_exe\main_app.cpp bin\ver_exe.res /Fe:bin\statsEdps.exe /Fo:bin\ /link /NOLOGO /SUBSYSTEM:WINDOWS user32.lib gdi32.lib comdlg32.lib advapi32.lib kernel32.lib
           if errorlevel 1 exit /b 1
 
       - name: Upload built binaries
         uses: actions/upload-artifact@v4
         with:
-          name: statsEdps-v1.0.5-x86
+          name: statsEdps-v${{ env.APP_VER }}-x86
           path: |
             **/bin/statsEdps.exe
             **/bin/statsEdps_hooks.dll
