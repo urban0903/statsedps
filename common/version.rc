@@ -1,0 +1,40 @@
+#include <winver.h>
+#include "version.h"
+
+#ifdef STATSEDPS_IS_DLL
+  #define RC_FILETYPE VFT_DLL
+  #define RC_ORIGNAME "statsEdps_hooks.dll"
+  #define RC_FILEDESC STATSEDPS_FULL_TITLE " Hook DLL (NFS ProStreet)"
+#else
+  #define RC_FILETYPE VFT_APP
+  #define RC_ORIGNAME "statsEdps.exe"
+  #define RC_FILEDESC STATSEDPS_FULL_TITLE " (NFS ProStreet)"
+#endif
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    STATSEDPS_VER_MAJOR,STATSEDPS_VER_MINOR,STATSEDPS_VER_PATCH,0
+ PRODUCTVERSION STATSEDPS_VER_MAJOR,STATSEDPS_VER_MINOR,STATSEDPS_VER_PATCH,0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       RC_FILETYPE
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "statsEdps"
+            VALUE "FileDescription",  RC_FILEDESC
+            VALUE "FileVersion",      STATSEDPS_VER_STR ".0"
+            VALUE "InternalName",     STATSEDPS_APP_NAME
+            VALUE "OriginalFilename", RC_ORIGNAME
+            VALUE "ProductName",      STATSEDPS_APP_NAME
+            VALUE "ProductVersion",   STATSEDPS_VER_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

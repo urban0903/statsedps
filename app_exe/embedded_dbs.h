@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 
-// Auto-generated lossless embedded databases for statsEdps v1.0.4
+// Auto-generated lossless embedded databases for statsEdps (embedded)
 // Stock cars: 76, Modes: 275
 // VLT profile cars: 76, Slots: 836, Items: 9887
 

@@ -10,12 +10,15 @@ endif()
 
 add_library(statsEdps_hooks SHARED
     hook_dll/statsEdps_hooks.cpp
+    common/version.rc
 )
+target_compile_definitions(statsEdps_hooks PRIVATE STATSEDPS_IS_DLL)
 target_include_directories(statsEdps_hooks PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common)
 set_target_properties(statsEdps_hooks PROPERTIES PREFIX "" OUTPUT_NAME "statsEdps_hooks")
 
 add_executable(statsEdps WIN32
     app_exe/main_app.cpp
+    common/version.rc
 )
 target_include_directories(statsEdps PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common)
 target_link_libraries(statsEdps PRIVATE user32 gdi32 comdlg32 advapi32)

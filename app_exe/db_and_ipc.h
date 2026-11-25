@@ -155,7 +155,7 @@ struct Databases {
 
     void initPaths() {
         cfgIniPath = GetAppDataDirUtf8() + "\\statsEdps_v105.ini";
-        // В v1.0.5 обе базы (76/76) вшиты напрямую в statsEdps.exe — старые пути от v1.0.3 игнорируются!
+        // В v1.0.5 обе базы (76/76) вшиты напрямую в statsEdps.exe — внешние .ini-пути не требуются!
         stockDbPath.clear();
         profilesDbPath.clear();
         loadEmbeddedStockDB();
@@ -558,8 +558,9 @@ class GameBridge {
 public:
     bool isConnected() const {
         if (!shm || attachedPid == 0) return false;
-        return shm->magic == SHM_MAGIC && shm->dllPid == attachedPid &&
-               shm->dllUnloaded == 0 && (GetTickCount() - shm->dllHeartbeat) < 3000u;
+        return shm->magic == SHM_MAGIC && shm->version == SHM_VERSION &&
+               shm->dllPid == attachedPid && shm->dllUnloaded == 0 &&
+               (GetTickCount() - shm->dllHeartbeat) < 3000u;
     }
 
     std::string getStatus() const { return statusText; }
@@ -619,9 +620,16 @@ public:
                 statusText = "Ошибка подключения: " + err;
                 return;
             }
+            attachedPid = pid;
+            statusText = "Хуки внедрены в nfs.exe (PID " + std::to_string(pid) + ")";
+        } else {
+            attachedPid = pid;
+            if (!isConnected()) {
+                statusText = "В nfs.exe осталась старая DLL — перезапусти nfs.exe!";
+            } else {
+                statusText = "Подключено к nfs.exe (PID " + std::to_string(pid) + ")";
+            }
         }
-        attachedPid = pid;
-        statusText = "Хуки внедрены в nfs.exe (PID " + std::to_string(pid) + ")";
     }
 
     bool sendCommand(uint32_t cmdType, uint32_t p1 = 0, uint32_t p2 = 0, float fp = 0.0f,

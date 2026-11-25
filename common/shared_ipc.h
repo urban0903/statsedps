@@ -1,20 +1,21 @@
 #pragma once
 #include <cstdint>
 #include <cstring>
+#include "version.h"
 
 // ============================================================================
 // Shared IPC Contract between statsEdps.exe (Win32) and statsEdps_hooks.dll (Win32)
 // Both binaries MUST be compiled as 32-bit x86 (Win32) to match nfs.exe!
 // ============================================================================
 
-static constexpr const char* APP_NAME         = "statsEdps";
-static constexpr const char* APP_VERSION      = "v1.0.5";
-static constexpr const char* APP_FULL_TITLE   = "statsEdps v1.0.5";
+static constexpr const char* APP_NAME         = STATSEDPS_APP_NAME;
+static constexpr const char* APP_VERSION      = "v" STATSEDPS_VER_STR;
+static constexpr const char* APP_FULL_TITLE   = STATSEDPS_FULL_TITLE;
 
 static constexpr uint32_t SHM_MAGIC   = 0x53454450u; // 'SEDP'
-static constexpr uint32_t SHM_VERSION = 5u;
-static constexpr const char* SHM_NAME           = "Local\\statsEdpsSHM_v1";
-static constexpr const char* SHM_CMD_EVENT_NAME = "Local\\statsEdpsCmdEvt_v1";
+static constexpr uint32_t SHM_VERSION = (STATSEDPS_VER_MAJOR * 10000u) + (STATSEDPS_VER_MINOR * 100u) + STATSEDPS_VER_PATCH;
+static constexpr const char* SHM_NAME           = "Local\\statsEdpsSHM_" STATSEDPS_VER_STR;
+static constexpr const char* SHM_CMD_EVENT_NAME = "Local\\statsEdpsCmdEvt_" STATSEDPS_VER_STR;
 
 static constexpr int NUM_SLIDERS       = 30;
 static constexpr int NUM_UPGRADE_PARTS = 8;

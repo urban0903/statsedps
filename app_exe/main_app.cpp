@@ -73,9 +73,7 @@ struct SliderHit {
 };
 
 enum BtnId {
-    BTN_PICK_STOCK = 1,
-    BTN_PICK_VLT,
-    BTN_MODE_TOGGLE,
+    BTN_MODE_TOGGLE = 1,
     BTN_TEMP_SNAP,
     BTN_TOPMOST,
     BTN_KMH,
@@ -1384,28 +1382,6 @@ static void RenderAll(HDC hdc, int W, int H) {
 // ============================================================================
 // Actions & Input Handling
 // ============================================================================
-static std::string PickLuaFile(HWND owner, const wchar_t* title, const std::string& curPath) {
-    wchar_t fileBuf[MAX_PATH] = {};
-    std::wstring initFile = Utf8ToWide(FileNameOnly(curPath));
-    wcsncpy(fileBuf, initFile.c_str(), MAX_PATH - 1);
-
-    std::wstring initDir;
-    size_t pos = curPath.find_last_of("\\/");
-    if (pos != std::string::npos) initDir = Utf8ToWide(curPath.substr(0, pos));
-
-    OPENFILENAMEW ofn = {};
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner   = owner;
-    ofn.lpstrFilter = L"База Lua (*.lua)\0*.lua\0Все файлы (*.*)\0*.*\0";
-    ofn.lpstrFile   = fileBuf;
-    ofn.nMaxFile    = MAX_PATH;
-    ofn.lpstrInitialDir = initDir.empty() ? nullptr : initDir.c_str();
-    ofn.lpstrTitle  = title;
-    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
-    if (GetOpenFileNameW(&ofn)) return WideToUtf8(fileBuf);
-    return "";
-}
-
 static void SendSliderTicks(int sIdx, int ticksInt) {
     if (sIdx < 0 || sIdx >= NUM_SLIDERS) return;
     ShmSlider& st = g_app.shmCopy.sliders[sIdx];
@@ -1434,30 +1410,6 @@ static void ApplySliderDragAtX(int x) {
 
 static void HandleButtonClick(int id) {
     switch (id) {
-        case BTN_PICK_STOCK: {
-            std::string p = PickLuaFile(g_app.hwnd, L"Выбрать файл базы стока (cars_stock_db.lua)", g_app.dbs.stockDbPath);
-            if (!p.empty()) {
-                g_app.dbs.stockDbPath = p;
-                bool ok = g_app.dbs.loadStockDB(true);
-                g_app.dbs.rebuildProfileIndices();
-                g_app.dbs.saveConfig();
-                g_app.statusLine = ok ? ("Статус: Загружена база стока: " + FileNameOnly(p)) : "Статус: Ошибка чтения файла базы стока.";
-                g_app.rebuildDetailRows();
-            }
-            break;
-        }
-        case BTN_PICK_VLT: {
-            std::string p = PickLuaFile(g_app.hwnd, L"Выбрать файл VLT-базы (parts_profiles_db.lua)", g_app.dbs.profilesDbPath);
-            if (!p.empty()) {
-                g_app.dbs.profilesDbPath = p;
-                bool ok = g_app.dbs.loadProfilesDB(true);
-                g_app.dbs.saveConfig();
-                if (ok) g_app.bridge.syncKnownCarTypes(g_app.dbs);
-                g_app.statusLine = ok ? ("Статус: Загружена VLT-база: " + FileNameOnly(p)) : "Статус: Ошибка чтения VLT-базы.";
-                g_app.rebuildDetailRows();
-            }
-            break;
-        }
         case BTN_MODE_TOGGLE:
             g_app.useStockDB = !g_app.useStockDB;
             if (!g_app.useStockDB && g_app.shmCopy.hasValidSnap) {
@@ -1776,9 +1728,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     int sx = (GetSystemMetrics(SM_CXSCREEN) - ww) / 2;
     int sy = std::max(10, (GetSystemMetrics(SM_CYSCREEN) - wh) / 2);
 
+    std::wstring wndTitle = Utf8ToWide(APP_FULL_TITLE);
     g_app.hwnd = CreateWindowExW(
         0, wc.lpszClassName,
-        L"statsEdps v1.0.5",
+        wndTitle.c_str(),
         style, sx, sy, ww, wh, nullptr, nullptr, hInst, nullptr
     );
     if (!g_app.hwnd) return 1;
